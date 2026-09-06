@@ -1,0 +1,1120 @@
+
+AI 렌더러 개발
+
+Gemini가 분석해 반환한 PBR 값(알베도 컬러, Roughness, Metallic, Normal Map 등)의 수치를 확인하고, 구체(Sphere) 프리뷰에 적용된 질감을 실시간으로 확인하는 검수 패널 구성입니다.
+
+이 구성은 상용 3D 툴(Substance Painter, Blender 등)의 Inspector/Material Preview 창과 동일한 메커니즘입니다. 전체 씬 모델과는 별도로 독립된 작은 구체(Material Ball) 전용 뷰포트를 하나 더 띄우고, 그 아래에 수치 조절 슬라이더(QSlider / QDoubleSpinBox)를 배치하면 됩니다.
+
+동작 메커니즘
+Gemini 분석 및 JSON 수신: 사용자가 챗봇에 *"비에 젖은 거친 아스팔트"*라고 입력하면 Gemini가 PBR 수치(color, roughness, metallic, normal_scale)를 반환합니다.
+
+속성 파라미터 창 동기화: 수신된 값에 맞춰 슬라이더와 색상 박스가 자동으로 해당 수치로 이동합니다.
+
+구체(Sphere) 프리뷰 실시간 렌더: 구체 전용 뷰포트의 머티리얼이 즉각 업데이트되어 빛 반사와 요철을 한눈에 검수할 수 있습니다.
+
+수동 미세 조정(Fine-Tuning): AI가 잡은 값이 100% 마음에 들지 않으면, 사용자가 직접 슬라이더를 밀어 수치를 미세 조정한 뒤 [모델에 적용] 버튼을 눌러 본 모델 레이어로 보냅니다.
+
+PyQt5 + PyVista 완성 구현 코드
+이 코드는 메인 건축 모델 뷰포트(좌), 구체 프리뷰 & 수치 조절 패널(중), Gemini 챗봇(우) 3개 영역으로 완벽히 연동됩니다.
+
+import sys
+import json
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTextEdit, QLineEdit, QPushButton, QLabel, QSplitter, QSlider,
+    QDoubleSpinBox, QGroupBox, QFormLayout
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+import pyvista as pv
+from pyvistaqt import QtInteractor
+from google import genai
+
+# 1. Gemini 비동기 워커
+class MaterialWorker(QThread):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, prompt_text):
+        super().__init__()
+        self.prompt_text = prompt_text
+
+    def run(self):
+        try:
+            client = genai.Client() # 환경변수 GEMINI_API_KEY
+            system_instruction = """
+            당신은 3D PBR 머티리얼 전문가입니다.
+            사용자의 질감 설명을 분석하여 정확한 PBR 파라미터를 JSON으로 반환하세요.
+            스키마:
+            {
+              "color": [R, G, B], // 0.0 ~ 1.0
+              "roughness": 0.5,    // 0.0 ~ 1.0
+              "metallic": 0.0,     // 0.0 ~ 1.0
+              "normal_scale": 1.0, // 0.0 ~ 3.0
+              "desc": "머티리얼 설명"
+            }
+            """
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=self.prompt_text,
+                config={
+                    "system_instruction": system_instruction,
+                    "response_mime_type": "application/json"
+                }
+            )
+            self.finished.emit(json.loads(response.text))
+        except Exception as e:
+            self.error.emit(str(e))
+
+# 2. 메인 윈도우
+class MaterialStudioApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PBR 머티리얼 검수 및 프리뷰 스튜디오")
+        self.resize(1400, 850)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(splitter)
+
+        # ----------------- [1] 좌측: 메인 타깃 모델 뷰포트 -----------------
+        left_box = QWidget()
+        left_layout = QVBoxLayout(left_box)
+        left_layout.addWidget(QLabel("<b>[메인 건축 씬 뷰포트]</b>"))
+        self.main_plotter = QtInteractor(self)
+        self.main_plotter.set_background("#18181b")
+        left_layout.addWidget(self.main_plotter.interactor)
+        
+        # 메인 모델 (샘플 큐브/건물 벽체)
+        self.main_mesh = pv.Cube()
+        self.main_mesh.compute_normals(inplace=True)
+        self.main_actor = self.main_plotter.add_mesh(
+            self.main_mesh, color=[0.7, 0.7, 0.7], pbr=True, roughness=0.5, metallic=0.0
+        )
+        self.setup_lighting(self.main_plotter)
+        splitter.addWidget(left_box)
+
+        # ----------------- [2] 중앙: 구체 프리뷰 및 파라미터 인스펙터 -----------------
+        center_box = QWidget()
+        center_layout = QVBoxLayout(center_box)
+        center_layout.addWidget(QLabel("<b>[머티리얼 볼 프리뷰 & 속성]</b>"))
+
+        # 구체 전용 작은 뷰포트
+        self.ball_plotter = QtInteractor(self)
+        self.ball_plotter.set_background("#222226")
+        center_layout.addWidget(self.ball_plotter.interactor, stretch=4)
+
+        self.ball_mesh = pv.Sphere(radius=1.0, theta_resolution=80, phi_resolution=80)
+        self.ball_mesh.compute_normals(inplace=True)
+        self.ball_actor = self.ball_plotter.add_mesh(
+            self.ball_mesh, color=[0.8, 0.8, 0.8], pbr=True, roughness=0.5, metallic=0.0
+        )
+        self.setup_lighting(self.ball_plotter)
+
+        # 수치 제어 패널 (Inspector)
+        prop_group = QGroupBox("PBR 파라미터 수동 조절")
+        form = QFormLayout(prop_group)
+
+        self.spin_rough = QDoubleSpinBox()
+        self.spin_rough.setRange(0.0, 1.0)
+        self.spin_rough.setSingleStep(0.05)
+        self.spin_rough.setValue(0.5)
+        self.spin_rough.valueChanged.connect(self.on_param_changed)
+        form.addRow("Roughness (거칠기):", self.spin_rough)
+
+        self.spin_metal = QDoubleSpinBox()
+        self.spin_metal.setRange(0.0, 1.0)
+        self.spin_metal.setSingleStep(0.05)
+        self.spin_metal.setValue(0.0)
+        self.spin_metal.valueChanged.connect(self.on_param_changed)
+        form.addRow("Metallic (금속성):", self.spin_metal)
+
+        self.spin_normal = QDoubleSpinBox()
+        self.spin_normal.setRange(0.0, 3.0)
+        self.spin_normal.setSingleStep(0.1)
+        self.spin_normal.setValue(1.0)
+        self.spin_normal.valueChanged.connect(self.on_param_changed)
+        form.addRow("Normal Scale (요철):", self.spin_normal)
+
+        center_layout.addWidget(prop_group, stretch=2)
+
+        # 메인 모델 적용 버튼
+        self.apply_to_main_btn = QPushButton("✔ 메인 모델에 이 머티리얼 적용")
+        self.apply_to_main_btn.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 8px;")
+        self.apply_to_main_btn.clicked.connect(self.apply_to_main_scene)
+        center_layout.addWidget(self.apply_to_main_btn)
+
+        splitter.addWidget(center_box)
+
+        # ----------------- [3] 우측: Gemini AI 디렉터 -----------------
+        right_box = QWidget()
+        right_layout = QVBoxLayout(right_box)
+        right_layout.addWidget(QLabel("<b>[Gemini AI 챗봇]</b>"))
+
+        self.chat_history = QTextEdit()
+        self.chat_history.setReadOnly(True)
+        right_layout.addWidget(self.chat_history)
+
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("예: 광택 있는 붉은색 세라믹 타일, 낡고 녹슨 철판...")
+        self.input_field.returnPressed.connect(self.request_gemini)
+        right_layout.addWidget(self.input_field)
+
+        self.send_btn = QPushButton("AI 재질 생성")
+        self.send_btn.clicked.connect(self.request_gemini)
+        right_layout.addWidget(self.send_btn)
+
+        splitter.addWidget(right_box)
+        splitter.setSizes([550, 450, 400])
+
+        self.current_color = [0.8, 0.8, 0.8]
+
+    def setup_lighting(self, plotter):
+        """PBR 반사광 검수용 3점 조명 세팅"""
+        plotter.renderer.RemoveAllLights()
+        key = pv.Light(position=(3, 3, 5), focal_point=(0, 0, 0), color='white', intensity=1.2)
+        fill = pv.Light(position=(-3, -2, 3), focal_point=(0, 0, 0), color=(0.8, 0.9, 1.0), intensity=0.6)
+        rim = pv.Light(position=(0, -4, -3), focal_point=(0, 0, 0), color=(1.0, 0.9, 0.8), intensity=0.8)
+        plotter.add_light(key)
+        plotter.add_light(fill)
+        plotter.add_light(rim)
+
+    def request_gemini(self):
+        text = self.input_field.text().strip()
+        if not text:
+            return
+        self.chat_history.append(f"<b>사용자:</b> {text}")
+        self.input_field.clear()
+        self.send_btn.setEnabled(False)
+
+        self.worker = MaterialWorker(text)
+        self.worker.finished.connect(self.on_gemini_received)
+        self.worker.error.connect(lambda err: self.chat_history.append(f"<span style='color:red;'>오류: {err}</span>"))
+        self.worker.start()
+
+    def on_gemini_received(self, data):
+        self.send_btn.setEnabled(True)
+        self.chat_history.append(f"<b>Gemini:</b> {data.get('desc', '설정 완료')}\n")
+
+        # 수신된 값으로 변수 갱신
+        self.current_color = data.get("color", [0.8, 0.8, 0.8])
+        rough = float(data.get("roughness", 0.5))
+        metal = float(data.get("metallic", 0.0))
+        norm = float(data.get("normal_scale", 1.0))
+
+        # UI 슬라이더/스핀박스 값 자동 갱신 (시그널 차단 후 세팅해 중복 트리거 방지)
+        self.spin_rough.blockSignals(True)
+        self.spin_metal.blockSignals(True)
+        self.spin_normal.blockSignals(True)
+        self.spin_rough.setValue(rough)
+        self.spin_metal.setValue(metal)
+        self.spin_normal.setValue(norm)
+        self.spin_rough.blockSignals(False)
+        self.spin_metal.blockSignals(False)
+        self.spin_normal.blockSignals(False)
+
+        # 머티리얼 볼(Sphere) 뷰포트에 실시간 반영
+        self.update_ball_material()
+
+    def on_param_changed(self):
+        """슬라이더 수치를 수동 변경했을 때 즉각 구체 프리뷰 갱신"""
+        self.update_ball_material()
+
+    def update_ball_material(self):
+        prop = self.ball_actor.GetProperty()
+        prop.SetColor(self.current_color[0], self.current_color[1], self.current_color[2])
+        prop.SetRoughness(self.spin_rough.value())
+        prop.SetMetallic(self.spin_metal.value())
+        prop.SetNormalScale(self.spin_normal.value())
+        self.ball_plotter.render()
+
+    def apply_to_main_scene(self):
+        """검수가 끝난 머티리얼을 메인 씬의 본 모델에 덮어씌우기"""
+        prop = self.main_actor.GetProperty()
+        prop.SetColor(self.current_color[0], self.current_color[1], self.current_color[2])
+        prop.SetRoughness(self.spin_rough.value())
+        prop.SetMetallic(self.spin_metal.value())
+        prop.SetNormalScale(self.spin_normal.value())
+        self.main_plotter.render()
+        self.chat_history.append("<i>[시스템] 메인 모델에 현재 머티리얼이 적용되었습니다.</i>")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = MaterialStudioApp()
+    win.show()
+    sys.exit(app.exec_())
+
+
+//=============================
+
+이 구성의 실무적 장점
+직관적인 사전 검수: 메인 건축 모델이 복잡하더라도 단순한 구체(Sphere)의 곡면 반사를 통해 빛이 어떻게 맺히는지(Roughness/Metallic) 즉시 파악할 수 있습니다.
+
+AI의 환각 보정: AI가 러프니스 수치를 너무 미끄럽게 잡았을 때, 다시 프롬프트를 치지 않고도 슬라이더로 0.1~0.2 정도만 즉시 올려 잡을 수 있습니다.
+
+독립 렌더링: 구체 뷰포트와 메인 씬 뷰포트가 분리되어 있어 메인 씬 카메라 앵글을 유지한 채 머티리얼만 따로 테스트할 수 있습니다.
+
+//=============================
+
+머티리얼 에디터 단계 > 맵핑단계 > 카메라 + 조명 > 구글 나노 바나나 렌더링 단계로 개발 진행
+
+단계별 파이프라인 아키텍처
+
+[Step 1. 머티리얼 에디터]
+  │  Gemini 챗봇 프롬프트 -> PBR 수치 도출 -> 구체(Sphere) 프리뷰 검수
+  ▼
+[Step 2. 부품 맵핑 단계]
+  │  검수된 머티리얼을 건축 모델의 특정 레이어(외벽, 창문 등)에 바인딩
+  ▼
+[Step 3. 카메라 + 조명 세팅]
+  │  건축물 투시 화각(FoV), 태양광/인공조명 배치 -> 오프스크린 기본 렌더 캡처
+  ▼
+[Step 4. 나노 바나나 렌더링]
+  │  캡처된 구도/조명 베이스 이미지 + 스타일 프롬프트 -> 최종 실사 이미지 생성
+
+단계별 상세 구현 명세
+Step 1. 머티리얼 에디터 (검수 및 생성)
+
+//=============================
+
+역할: Gemini 2.5 Flash를 이용해 자연어로 텍스처/재질을 구상하고 PBR 파라미터를 확정합니다.
+
+출력 데이터: 머티리얼 딕셔너리
+
+material_data = {
+    "name": "Modern_Concrete",
+    "color": [0.75, 0.75, 0.72],
+    "roughness": 0.85,
+    "metallic": 0.05,
+    "normal_scale": 1.2
+}
+
+UI: 전용 구체(Sphere) 프리뷰 뷰포트 + 수치 미세조정 슬라이더.
+
+Step 2. 맵핑 단계 (레이어 바인딩)
+
+역할: .3ds 건축 모델에서 분할된 서브메시(예: Exterior_Wall, Glass_Window, Roof_Slab) 목록을 트리 뷰에서 확인하고, Step 1에서 만든 재질을 타깃 부품에 할당합니다.
+
+코드 바인딩:
+
+# 특정 레이어 액터에 PBR 속성 주입
+target_actor = self.actors["Exterior_Wall"]
+prop = target_actor.GetProperty()
+prop.SetColor(*material_data["color"])
+prop.SetRoughness(material_data["roughness"])
+prop.SetMetallic(material_data["metallic"])
+prop.SetNormalScale(material_data["normal_scale"])
+
+Step 3. 카메라 + 조명 단계 (구도 및 광원 확정)
+
+역할: 렌더링할 시점과 빛의 방향을 확정합니다. 챗봇에 *"오후 5시의 긴 그림자가 드리우는 따뜻한 일몰 조명 세팅해줘"*라고 지시하면 광원의 각도와 색온도를 자동 배치합니다.
+
+프레임 캡처: PyVista의 화면을 나노 바나나(Img2Img) 입력용 고해상도 NumPy 배열 또는 임시 PNG 파일로 추출합니다.
+
+# 베이스 가이드 이미지 캡처
+self.plotter.screenshot("temp_composition.png", return_img=False)
+
+Step 4. 구글 나노 바나나 렌더링 (최종 완성)
+
+역할: Step 3에서 캡처한 이미지를 Gemini Image API에 베이스로 전달하여, 3D 모델의 투시와 조명 방향을 유지한 채 극실사 질감과 환경 디테일을 생성합니다.
+
+API 호출 구조:
+
+from google import genai
+from PIL import Image
+
+client = genai.Client()
+base_img = Image.open("temp_composition.png")
+
+# 구도와 빛 방향을 유지하며 실사 건축 사진으로 변환
+response = client.models.generate_content(
+    model="gemini-2.5-flash-image", # 또는 나노 바나나 지원 엔드포인트
+    contents=[
+        base_img,
+        "Photorealistic architectural photography, 8k resolution, modern villa, "
+        "keep the exact geometry, perspective lines, and lighting angles from the input image, "
+        "add realistic foliage, ambient occlusion, and detailed surface imperfections."
+    ]
+)
+
+PyQt 4단계 탭(Wizard) UI 설계 전략사용자가 헷갈리지 않도록 PyQt 상단에 QTabWidget을 배치하여 순차적으로 진행하도록 구성하는 것이 가장 직관적입니다.탭 순서화면 명칭주요 위젯 구성Tab 1머티리얼 에디터구체 프리뷰, Gemini 대화창, PBR 슬라이더, '프리셋 저장' 버튼Tab 2레이어 맵핑3D 모델 뷰어, 부품 목록 트리(QTreeWidget), 드롭다운 재질 할당Tab 3카메라 & 조명조명 프리셋(골든아워, 정오, 스튜디오), 카메라 FoV 슬라이더, 씬 캡처 버튼Tab 4AI 최종 렌더링베이스 캡처 프리뷰 vs 나노 바나나 최종 생성 결과 비교 뷰, 저장 버튼
+
+이 순서대로 개발을 진행하면 각 단계마다 모듈화된 테스트가 가능하여 디버깅이 쉬워지고 완성도 높은 건축 시각화 툴을 만들 수 있습니다.
+
+//====================================
+
+무료 API 키(GEMINI_API_KEY)를 연결하여, 텍스트 지시와 3D 베이스 스크린샷을 결합한 실사 건축 렌더링 스튜디오를 구성하는 방법입니다.
+
+UI 레이아웃 구조 설계
+첨부 이미지의 UI 구조를 PyQt5 위젯으로 1:1 매핑하면 다음과 같습니다.
+
+상단 네비게이션 (QTabBar / QHBoxLayout)
+
+작업 모드 전환: 3D Base to Render, Text to Render, Sketch to Render, Render Variation
+
+좌측 컨트롤 사이드바 (QScrollArea + QVBoxLayout, 약 350px 고정 폭)
+
+Style Selector: 콤보박스 또는 썸네일 버튼 (Realistic, Modern Minimalist, Cyberpunk, Wooden Cabin 등)
+
+Describe the Scene (Gemini 챗봇 입력창): 사용자의 자연어 묘사 입력창 (QTextEdit)
+
+Creativity (창의성/변형 강도): QSlider (0% ~ 100%, Stable Diffusion의 Denoising Strength / Gemini 프롬프트 온도값 매핑)
+
+Generate Button: 하단 고정 실행 버튼 (QPushButton)
+
+우측 메인 뷰포트 (QSplitter 또는 QStackedWidget)
+
+작업 중: 3D 모델(PyVista 뷰포트)에서 카메라 앵글과 조명을 조절
+
+렌더 완료: 나노 바나나/Gemini Image가 생성한 고해상도 실사 이미지를 QLabel 또는 인터랙티브 뷰어로 표시
+
+완성형 PyQt5 프로토타입 코드
+이 코드는 첨부 이미지의 다크 테마 디자인을 그대로 적용했으며, Gemini 2.5 Flash를 사용해 프롬프트를 실사 건축 사진용으로 확장한 뒤 렌더링 파이프라인으로 연결하는 전체 구조를 담고 있습니다.
+
+import sys
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QTextEdit, QPushButton, QSlider, QComboBox, QFrame,
+    QTabBar, QSplitter, QProgressBar
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QPixmap, QImage
+from google import genai
+from PIL import Image
+import io
+
+# 1. Gemini / 렌더 비동기 워커 스레드
+class RenderWorker(QThread):
+    finished = pyqtSignal(bytes, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, prompt, style, creativity):
+        super().__init__()
+        self.prompt = prompt
+        self.style = style
+        self.creativity = creativity
+
+    def run(self):
+        try:
+            client = genai.Client()  # GEMINI_API_KEY 환경변수 자동 인식
+
+            # 1단계: Gemini 2.5 Flash로 건축 전문 실사 프롬프트 확장
+            enhancer_prompt = f"""
+            건축 시각화 전문가로서 아래 요구사항을 전문 8K 건축 사진용 영문 프롬프트로 변환하세요.
+            - 원본 요구: {self.prompt}
+            - 스타일: {self.style}
+            - 창의성 수치: {self.creativity}%
+            오직 최종 생성용 영문 프롬프트 문장만 반환하세요.
+            """
+            enhanced = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=enhancer_prompt
+            )
+            final_prompt = enhanced.text.strip()
+
+            # 2단계: 나노 바나나 / Gemini Image 생성 API 호출
+            # (3D 베이스 이미지가 있을 경우 contents=[base_img, final_prompt] 형태로 전달)
+            img_response = client.models.generate_content(
+                model="gemini-2.5-flash-image",
+                contents=f"Photorealistic 8k architectural render, {final_prompt}"
+            )
+
+            # 반환된 이미지 바이트 추출
+            for part in img_response.parts:
+                if hasattr(part, "image"):
+                    self.finished.emit(part.image, final_prompt)
+                    return
+
+            self.error.emit("이미지 데이터를 받지 못했습니다.")
+        except Exception as e:
+            self.error.emit(str(e))
+
+# 2. 메인 UI 윈도우 (첨부 이미지 레이아웃 복제)
+class RendairCloneApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Rendair AI Architecture Studio (PyQt)")
+        self.resize(1350, 850)
+
+        # 첨부 화면 기반 모던 다크 테마 QSS
+        self.setStyleSheet("""
+            QMainWindow { background-color: #1a1625; }
+            QWidget { color: #e2e8f0; font-family: 'Segoe UI', sans-serif; }
+            QTabBar::tab {
+                background: transparent; color: #94a3b8; padding: 10px 18px;
+                border-radius: 16px; margin: 4px; font-weight: bold;
+            }
+            QTabBar::tab:selected { background: #2e2842; color: #38bdf8; }
+            QFrame#sidebar {
+                background-color: #211c30; border-radius: 12px; padding: 16px;
+            }
+            QTextEdit, QComboBox {
+                background-color: #161220; border: 1px solid #332b4a;
+                border-radius: 8px; padding: 8px; color: #f8fafc;
+            }
+            QPushButton#genBtn {
+                background-color: #0284c7; color: white; font-weight: bold;
+                border-radius: 8px; padding: 12px; font-size: 14px;
+            }
+            QPushButton#genBtn:hover { background-color: #0369a1; }
+            QPushButton#genBtn:disabled { background-color: #332b4a; color: #64748b; }
+            QSlider::groove:horizontal { height: 6px; background: #332b4a; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #38bdf8; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #f8fafc; width: 14px; margin-top: -4px; margin-bottom: -4px; border-radius: 7px; }
+        """)
+
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        root_layout = QVBoxLayout(main_widget)
+        root_layout.setContentsMargins(20, 15, 20, 20)
+
+        # ----------------- [상단 네비게이션 탭바] -----------------
+        top_bar = QHBoxLayout()
+        logo = QLabel("<b>rendair</b>.pyqt")
+        logo.setStyleSheet("font-size: 20px; color: #f8fafc; margin-right: 30px;")
+        top_bar.addWidget(logo)
+
+        self.tab_bar = QTabBar()
+        self.tab_bar.addTab("3D Base to Render")
+        self.tab_bar.addTab("Text to Render")
+        self.tab_bar.addTab("Sketch to Render")
+        self.tab_bar.addTab("Render Variation")
+        top_bar.addWidget(self.tab_bar)
+        top_bar.addStretch()
+        root_layout.addLayout(top_bar)
+
+        # ----------------- [중앙 본문 스플리터] -----------------
+        content_layout = QHBoxLayout()
+
+        # [좌측 컨트롤 사이드바]
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(360)
+        s_layout = QVBoxLayout(sidebar)
+        s_layout.setSpacing(14)
+
+        s_layout.addWidget(QLabel("<b>Image Style</b>"))
+        self.style_combo = QComboBox()
+        self.style_combo.addItems(["Realistic Architectural Photo", "Modern Minimalist", "Nordic Wood & Warm", "Futuristic Concrete"])
+        s_layout.addWidget(self.style_combo)
+
+        s_layout.addWidget(QLabel("<b>Describe the scene (Gemini Prompt)</b>"))
+        self.prompt_input = QTextEdit()
+        self.prompt_input.setPlaceholderText("Main Subject + Materials + Lighting + Environment...\n예: 통유리창과 노출 콘크리트로 지어진 숲속의 2층 현대 주택, 일몰의 따뜻한 조명")
+        s_layout.addWidget(self.prompt_input)
+
+        # Creativity 슬라이더
+        c_header = QHBoxLayout()
+        c_header.addWidget(QLabel("<b>Creativity</b>"))
+        self.creativity_val_lbl = QLabel("60%")
+        self.creativity_val_lbl.setStyleSheet("color: #38bdf8;")
+        c_header.addStretch()
+        c_header.addWidget(self.creativity_val_lbl)
+        s_layout.addLayout(c_header)
+
+        self.slider_creativity = QSlider(Qt.Horizontal)
+        self.slider_creativity.setRange(0, 100)
+        self.slider_creativity.setValue(60)
+        self.slider_creativity.valueChanged.connect(lambda v: self.creativity_val_lbl.setText(f"{v}%"))
+        s_layout.addWidget(self.slider_creativity)
+
+        s_layout.addStretch()
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.setStyleSheet("QProgressBar::chunk { background-color: #38bdf8; }")
+        self.progress.hide()
+        s_layout.addWidget(self.progress)
+
+        self.gen_btn = QPushButton("Generate")
+        self.gen_btn.setObjectName("genBtn")
+        self.gen_btn.clicked.connect(self.start_generation)
+        s_layout.addWidget(self.gen_btn)
+
+        content_layout.addWidget(sidebar)
+
+        # [우측 대형 렌더링 캔버스]
+        self.canvas_frame = QFrame()
+        self.canvas_frame.setStyleSheet("background-color: #211c30; border-radius: 12px;")
+        canvas_layout = QVBoxLayout(self.canvas_frame)
+
+        self.render_display = QLabel("Your creation will appear here")
+        self.render_display.setAlignment(Qt.AlignCenter)
+        self.render_display.setStyleSheet("color: #64748b; font-size: 16px;")
+        canvas_layout.addWidget(self.render_display)
+
+        content_layout.addWidget(self.canvas_frame, stretch=1)
+        root_layout.addLayout(content_layout)
+
+    def start_generation(self):
+        text = self.prompt_input.toPlainText().strip()
+        if not text:
+            return
+
+        self.gen_btn.setEnabled(False)
+        self.progress.show()
+        self.progress.setRange(0, 0) # 무한 로딩 인디케이터
+        self.render_display.setText("Gemini가 실사 건축 렌더링을 계산 중입니다...")
+
+        # 비동기 스레드 실행
+        self.worker = RenderWorker(
+            prompt=text,
+            style=self.style_combo.currentText(),
+            creativity=self.slider_creativity.value()
+        )
+        self.worker.finished.connect(self.on_render_success)
+        self.worker.error.connect(self.on_render_error)
+        self.worker.start()
+
+    def on_render_success(self, img_bytes, final_prompt):
+        self.gen_btn.setEnabled(True)
+        self.progress.hide()
+
+        # 생성된 바이너리를 QPixmap으로 변환하여 메인 화면에 출력
+        pixmap = QPixmap()
+        pixmap.loadFromData(img_bytes)
+        scaled_pixmap = pixmap.scaled(
+            self.canvas_frame.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.render_display.setPixmap(scaled_pixmap)
+
+    def on_render_error(self, err_msg):
+        self.gen_btn.setEnabled(True)
+        self.progress.hide()
+        self.render_display.setText(f"렌더링 실패: {err_msg}")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = RendairCloneApp()
+    win.show()
+    sys.exit(app.exec_())
+
+
+//====================================
+
+이 구조의 핵심 확장 포인트
+3D Base to Render 탭 연동:
+우측 캔버스 영역에 QStackedWidget을 두어 평소에는 3D 뷰포트(PyVista)로 카메라 앵글을 잡다가, [Generate]를 누르면 뷰포트 캡처본을 Gemini Image API에 넘기고 생성된 결과물 이미지로 화면을 전환할 수 있습니다.
+
+Creativity 슬라이더 매핑:
+슬라이더 값이 낮을수록 3D 원본의 형태와 투시선을 엄격히 유지하도록 프롬프트에 "keep exact lines and geometry" 지침을 강하게 부여하고, 높을수록 화려한 식생과 디테일을 자율 생성하도록 프롬프트 템플릿에 동적으로 반영합니다.
+
+//====================================
+ 시댄스 AI 처럼 3D 카메라 이동 동선을 저장하여 랜더링 쪽으로 넘겨서 나노바나나 기반 동영상 제작 툴 개발
+
+3D 카메라 궤적(Camera Trajectory)을 기록해 AI 비디오 생성 파이프라인으로 넘기는 방식으로 동영상을 제작할 수 있습니다.
+
+다만 이미지 생성 모델(나노 바나나/Gemini Image)과 동영상 생성 모델(비디오 AI)의 처리 메커니즘이 다르므로, 파이프라인 구성 방식에 맞춰 구현해야 합니다.
+
+카메라 동선 기반 비디오 제작의 2가지 접근 방식
+방식 1. 키프레임 캡처 + 비디오 생성 모델 연동 (가장 추천하는 표준 방식)
+카메라 이동의 시작 지점과 끝 지점을 캡처해 비디오 모델의 양방향 프레임으로 전달하는 구조입니다.
+
+동작 순서:
+
+PyQt 뷰포트에서 마우스로 시점을 옮기며 [시작 키프레임 (0초)]과 [종료 키프레임 (5초)]의 카메라 위치를 저장합니다.
+
+뷰포트에서 시작 프레임 이미지(start.png)와 끝 프레임 이미지(end.png)를 오프스크린 캡처합니다.
+
+카메라 이동 벡터(예: "카메라가 우측으로 45도 회전하며 전진")를 Gemini 2.5 Flash가 영문 모션 프롬프트("Slow cinematic drone push-in, orbit right")로 변환합니다.
+
+이 데이터(시작/끝 이미지 + 카메라 모션 프롬프트)를 비디오 생성 모델(Google Veo, Kling, Runway Gen-3 등)의 API로 전송하여 매끄러운 5~10초 영상을 합성합니다.
+
+PyQt5 + PyVista 카메라 동선 저장 핵심 로직
+카메라의 위치(position), 주시점(focal_point), 상단 방향(view_up)을 키프레임 리스트에 기록하는 코드 구조입니다.
+
+import numpy as np
+
+class CameraPathManager:
+    def __init__(self, plotter):
+        self.plotter = plotter
+        self.keyframe_cameras = [] # 저장된 카메라 앵글 목록
+
+    def add_keyframe(self):
+        """현재 3D 뷰포트의 카메라 좌표를 키프레임으로 저장"""
+        cam = self.plotter.camera
+        pose = {
+            "position": tuple(cam.position),
+            "focal_point": tuple(cam.focal_point),
+            "view_up": tuple(cam.view_up)
+        }
+        self.keyframe_cameras.append(pose)
+        print(f"키프레임 등록 완료: 총 {len(self.keyframe_cameras)}개")
+
+    def export_start_end_frames(self):
+        """시작 및 끝 프레임 캡처 (AI 비디오 생성 API 입력용)"""
+        if len(self.keyframe_cameras) < 2:
+            return None, None
+        
+        # 1. 시작 카메라 적용 후 캡처
+        self._apply_camera(self.keyframe_cameras[0])
+        self.plotter.screenshot("render_start.png")
+        
+        # 2. 끝 카메라 적용 후 캡처
+        self._apply_camera(self.keyframe_cameras[-1])
+        self.plotter.screenshot("render_end.png")
+        
+        return "render_start.png", "render_end.png"
+
+    def _apply_camera(self, pose):
+        cam = self.plotter.camera
+        cam.position = pose["position"]
+        cam.focal_point = pose["focal_point"]
+        cam.view_up = pose["view_up"]
+        self.plotter.render()
+
+
+//==============================
+
+UI 연동 추천 구성
+카메라 타임라인 바: UI 하단에 [+ 키프레임 추가], [동선 미리보기 재생] 버튼을 배치합니다.
+
+모션 프롬프트 생성기: 카메라 좌표의 이동 방향을 분석해 Gemini가 자동으로 비디오 프롬프트(예: "Smooth Steadicam orbit shot around the modern villa, warm sunlight")를 완성해 줍니다.
+
+내보내기 옵션: 정지 이미지 렌더링뿐만 아니라 [카메라 경로 기반 비디오 렌더링] 버튼을 추가하여 영상 클립(.mp4)을 다운로드할 수 있도록 확장 가능함.
+
+//==============================
+
+나노 바나나로 시작이미지와 끝 이미지로 저장해서 구글 Flow에서 생성형 동영상 제작
+
+Google Flow는 Nano Banana(이미지 생성/편집)와 Veo(동영상 생성 모델)를 한곳에 묶어놓은 크리에이티브 AI 스튜디오 플랫폼이므로, PyQt에서 추출한 3D 데이터와 완벽하게 맞물립니다.
+
+추천 워크플로우 파이프라인
+
+[PyQt + PyVista 3D 뷰어]
+  │  카메라 이동 경로 설정: [시작 앵글] & [끝 앵글] 지정
+  ▼
+[오프스크린 캡처]
+  │  구도 1 (start_base.png)  /  구도 2 (end_base.png)
+  ▼
+[Nano Banana (Gemini Image)]
+  │  동일 시드/스타일 프롬프트 적용
+  ▼
+[실사 렌더 이미지 2장 완성]
+  │  시작 컷 (render_start.png)  /  종료 컷 (render_end.png)
+  ▼
+[Google Flow (Veo 비디오 엔진)]
+  │  - First Frame: render_start.png
+  │  - Last Frame: render_end.png
+  │  - Motion Prompt: "Smooth cinematic drone push-in and pan"
+  ▼
+[최종 고화질 건축 시네마틱 동영상 (.mp4)]
+
+이 방식이 특히 강력한 이유
+완벽한 형태 및 원근감 보존 (Flickering 방지)
+
+비디오 AI에게 텍스트 프롬프트만 주면 카메라가 돌면서 건물 창문이나 기둥 형태가 왜곡되는 '모핑 현상'이 자주 발생합니다.
+
+시작 프레임과 끝 프레임을 3D 모델 기반의 고화질 이미지(Nano Banana)로 딱 고정해두면, 중간 프레임(In-between)을 채우는 비디오 모델(Veo)이 건축물의 구조적 연속성을 매우 안정적으로 유지합니다.
+
+Google Flow 플랫폼과의 기능적 일치
+
+Google Flow 내부에는 이미 Nano Banana 모델과 고해상도 비디오 엔진(Veo)이 통합되어 있습니다.
+
+따라서 웹 UI(Google Flow)에서 직접 2장의 이미지를 드래그해 비디오를 생성할 수도 있고, 향후 Google AI Studio의 Veo API (client.models.generate_videos)를 파이썬 코드에 직접 연동해 PyQt 앱 안에서 버튼 한 번으로 원클릭 영상 완성을 노릴 수도 있습니다.
+
+제작 시 핵심 팁
+카메라 각도 변화 폭: 시작과 끝 프레임의 시점 차이가 180도 반대편처럼 너무 극단적이면 비디오 AI가 중간 지형을 유추하다가 건물이 녹아내릴 수 있습니다. 30°~60° 정도의 패닝/트래킹 동선이나 직선 전진(Push-in) + 약간의 틸트업 동선이 가장 자연스럽고 웅장한 건축 영상으로 나옵니다.
+
+프롬프트 일관성 유지: Nano Banana로 시작 이미지와 끝 이미지를 각각 생성할 때, 건물의 외장재(콘크리트, 목재 등)와 날씨/조명 조건(예: "Golden hour, sunset lighting") 프롬프트를 100% 동일하게 입력해야 두 프레임 간의 색감 이질감이 생기지 않습니다.
+
+//====================== 
+
+구글 Flow(Veo 비디오 엔진 기반)
+
+1. 구현 가능한 메커니즘
+PyQt 3D 뷰포트에서 추출한 카메라 동선을 Flow에서 충실하게 재현하는 표준 방법은 2단계 하이브리드 입력입니다.
+
+지오메트리 앵커 (시작 및 종료 프레임 고정)
+
+3D 카메라 궤적의 출발 지점(A)과 도착 지점(B)을 렌더링한 나노 바나나 이미지 2장을 Flow의 First Frame / Last Frame 슬롯에 각각 배치합니다.
+
+이렇게 하면 비디오 모델이 시작과 끝의 건물 형태, 투시선, 창문 위치를 벗어나지 못하도록 물리적으로 구속됩니다.
+
+3D 벡터를 시네마틱 카메라 프롬프트로 변환
+
+PyVista에서 계산된 카메라의 3차원 이동 벡터(시작점과 끝점의 거리, 각도 변화, 고도 변화)를 Gemini 챗봇이 Flow/Veo 전용 촬영 언어로 자동 변환합니다.
+
+예시 변환:
+
+내부 좌표: Δx: +5.0m, Δz: +2.0m, Yaw: -45°
+
+Gemini 생성 프롬프트: "Seamless orbital tracking shot moving counter-clockwise around the villa, slowly ascending from eye level to a low-angle drone perspective, perfectly connecting the initial and final frame with smooth momentum."
+
+2. Flow(Veo)가 특히 잘 따르는 카메라 모션 지침
+Google Flow의 기반 모델인 Veo는 영화 촬영 및 드론 조종에 쓰이는 전문 카메라 용어의 인지도가 높습니다. 동선에 따라 다음 키워드를 포함시키면 3D 카메라 경로와 매우 흡사하게 움직입니다.
+
+회전/공전 동선: Arc shot, Orbital shot around the building, Clockwise/Counter-clockwise pan
+
+직선 진입/후퇴: Dolly in / push-in towards the main entrance, Truck left following the facade
+
+상승/하강 부감: Pedestal up revealing the roof structure, Crane shot from ground to bird's-eye view
+
+렌즈 및 셔터 제어: Wide-angle lens (24mm), Steadycam smooth motion, Zero shaking
+
+3. 실제 파이프라인 연동 설계 (PyQt 앱 내부)
+PyQt 앱에서 동선 데이터를 추출할 때, 다음과 같이 버튼 클릭 한 번으로 Flow에 넣을 '이미지 세트'와 '모션 프롬프트 텍스트'를 클립보드에 복사해 주는 기능을 추가하면 됩니다.
+
+def export_for_google_flow(self):
+    # 1. 시작 및 끝 뷰포트 스크린샷 캡처
+    start_img_path, end_img_path = self.camera_manager.export_start_end_frames()
+    
+    # 2. 카메라 이동 특성 계산
+    cam_start = self.camera_manager.keyframe_cameras[0]
+    cam_end = self.camera_manager.keyframe_cameras[-1]
+    
+    # 3. Gemini에게 Flow 맞춤형 비디오 프롬프트 생성 요청
+    vector_prompt = f"""
+    카메라 시작 좌표: {cam_start['position']}, 주시점: {cam_start['focal_point']}
+    카메라 종료 좌표: {cam_end['position']}, 주시점: {cam_end['focal_point']}
+    이 이동 궤적을 Google Veo/Flow 비디오 생성기가 완벽히 따를 수 있는 전문적인 1줄 영문 카메라 모션 프롬프트로 작성해줘.
+    """
+    motion_prompt = self.gemini_client.generate(vector_prompt)
+    
+    # 사용자는 Flow 웹 UI에서 시작/끝 이미지 업로드 후 motion_prompt만 붙여넣으면 완료
+
+//==============================================
+
+PyQt 건축 렌더러 앱에 Google Flow / Veo(비디오 생성 모델) 연동을 위한 '동영상 설명서 & 프롬프트 가이드 패널'을 추가한 완성형 코드입니다.
+
+3D 뷰포트에서 저장한 시작/끝 카메라 좌표를 기반으로 Gemini가 Veo 맞춤형 모션 프롬프트를 자동 작성해주며, 사용자가 상단 탭에서 [Flow/Veo 동영상 제작 설명서]를 열어 단계별 가이드와 카메라 전문 프롬프트 문법을 즉시 확인할 수 있습니다.
+
+PyQt5 통합 실행 코드 (가이드 & 동영상 탭 추가)
+
+import sys
+import json
+import numpy as np
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTextEdit, QLineEdit, QPushButton, QLabel, QSplitter, QTabWidget,
+    QGroupBox, QFrame
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+import pyvista as pv
+from pyvistaqt import QtInteractor
+from google import genai
+
+# ----------------- [1. Gemini Veo 프롬프트 비동기 워커] -----------------
+class VeoPromptWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, start_cam, end_cam, user_scene_desc):
+        super().__init__()
+        self.start_cam = start_cam
+        self.end_cam = end_cam
+        self.user_scene_desc = user_scene_desc
+
+    def run(self):
+        try:
+            client = genai.Client() # 환경변수 GEMINI_API_KEY
+            
+            # 카메라 이동 벡터 간이 계산
+            pos1 = np.array(self.start_cam["position"])
+            pos2 = np.array(self.end_cam["position"])
+            delta = pos2 - pos1
+
+            system_instruction = """
+            당신은 시네마틱 건축 영상 촬영 감독이자 Google Flow/Veo 비디오 프롬프트 전문가입니다.
+            제공된 카메라 좌표 이동 벡터(Delta)와 건축물 설명을 분석하여,
+            Google Flow/Veo의 First/Last Frame 비디오 생성에 가장 효과적인 단일 영문 프롬프트를 작성하세요.
+            Dolly, Orbit, Crane, Pan, 렌즈 mm, 조명 일관성 등 영화 촬영 전문 용어를 적절히 배치하세요.
+            오직 최종 프롬프트 문장만 반환하세요.
+            """
+
+            query = f"""
+            건축물/씬 묘사: {self.user_scene_desc}
+            시작 카메라 위치: {pos1.tolist()}
+            종료 카메라 위치: {pos2.tolist()}
+            이동 델타 벡터 (dx, dy, dz): {delta.tolist()}
+            """
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=query,
+                config={"system_instruction": system_instruction}
+            )
+            self.finished.emit(response.text.strip())
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ----------------- [2. 메인 스튜디오 윈도우] -----------------
+class ArchStudioWithGuide(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Arch 3D Studio - Veo Video Director & Guide")
+        self.resize(1400, 900)
+
+        # 다크 테마 QSS
+        self.setStyleSheet("""
+            QMainWindow { background-color: #1a1625; }
+            QWidget { color: #e2e8f0; font-family: 'Segoe UI', sans-serif; }
+            QTabWidget::pane { border: 1px solid #2e2842; background: #211c30; border-radius: 8px; }
+            QTabBar::tab {
+                background: #161220; color: #94a3b8; padding: 10px 20px;
+                border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px;
+            }
+            QTabBar::tab:selected { background: #2e2842; color: #38bdf8; font-weight: bold; }
+            QTextEdit { background-color: #161220; border: 1px solid #332b4a; border-radius: 6px; padding: 8px; }
+            QLineEdit { background-color: #161220; border: 1px solid #332b4a; border-radius: 6px; padding: 6px; }
+            QPushButton { background-color: #0284c7; color: white; border-radius: 6px; padding: 8px 12px; font-weight: bold; }
+            QPushButton:hover { background-color: #0369a1; }
+            QGroupBox { border: 1px solid #332b4a; border-radius: 8px; margin-top: 12px; padding-top: 10px; font-weight: bold; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #38bdf8; }
+        """)
+
+        # 카메라 키프레임 보관소
+        self.keyframes = []
+
+        # 상단 탭 위젯 (작업 캔버스 vs 설명서)
+        self.main_tabs = QTabWidget()
+        self.setCentralWidget(self.main_tabs)
+
+        # 탭 1: 3D 씬 및 카메라 동선 에디터
+        self.tab_studio = QWidget()
+        self.build_studio_tab()
+        self.main_tabs.addTab(self.tab_studio, "🎬 3D 렌더 & 카메라 동선")
+
+        # 탭 2: Google Flow / Veo 동영상 제작 설명서
+        self.tab_guide = QWidget()
+        self.build_guide_tab()
+        self.main_tabs.addTab(self.tab_guide, "📖 Flow/Veo 비디오 제작 설명서")
+
+    def build_studio_tab(self):
+        layout = QHBoxLayout(self.tab_studio)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        splitter = QSplitter(Qt.Horizontal)
+        layout.addWidget(splitter)
+
+        # [좌측] PyVista 3D 뷰포트
+        left_box = QWidget()
+        v_box = QVBoxLayout(left_box)
+        v_box.addWidget(QLabel("<b>[3D 건축 뷰포트 - 마우스로 시점 조작]</b>"))
+
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background("#18181b")
+        v_box.addWidget(self.plotter.interactor)
+
+        # 샘플 건축물 모델
+        mesh = pv.Cube(x_length=4, y_length=6, z_length=2.5)
+        mesh.compute_normals(inplace=True)
+        self.plotter.add_mesh(mesh, color=[0.85, 0.82, 0.8], pbr=True, roughness=0.6)
+        
+        # 3점 조명 세팅
+        self.plotter.add_light(pv.Light(position=(5, 5, 8), intensity=1.2))
+        self.plotter.add_light(pv.Light(position=(-5, -3, 4), intensity=0.5))
+        self.plotter.reset_camera()
+        splitter.addWidget(left_box)
+
+        # [우측] 카메라 동선 및 Veo 프롬프트 생성 패널
+        right_box = QWidget()
+        r_box = QVBoxLayout(right_box)
+
+        # 1. 키프레임 컨트롤 박스
+        grp_cam = QGroupBox("3D 카메라 동선 제어")
+        c_layout = QVBoxLayout(grp_cam)
+
+        btn_row = QHBoxLayout()
+        self.btn_set_start = QPushButton("1️⃣ 시작점(A) 등록")
+        self.btn_set_start.clicked.connect(lambda: self.record_keyframe("시작점(A)"))
+        btn_row.addWidget(self.btn_set_start)
+
+        self.btn_set_end = QPushButton("2️⃣ 종료점(B) 등록")
+        self.btn_set_end.clicked.connect(lambda: self.record_keyframe("종료점(B)"))
+        btn_row.addWidget(self.btn_set_end)
+        c_layout.addLayout(btn_row)
+
+        self.lbl_cam_status = QLabel("카메라 시작점과 종료점을 각각 등록하세요.")
+        self.lbl_cam_status.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        c_layout.addWidget(self.lbl_cam_status)
+        r_box.addWidget(grp_cam)
+
+        # 2. 씬 묘사 & Veo 생성기
+        grp_veo = QGroupBox("Google Veo 프롬프트 디렉터")
+        v_layout = QVBoxLayout(grp_veo)
+
+        v_layout.addWidget(QLabel("건축 씬 콘셉트 (Gemini 입력):"))
+        self.input_scene = QLineEdit()
+        self.input_scene.setPlaceholderText("예: 일몰 황금빛 조명이 비치는 모던 미니멀 콘크리트 빌라")
+        v_layout.addWidget(self.input_scene)
+
+        self.btn_gen_veo = QPushButton("🚀 Veo 비디오 프롬프트 & 이미지 추출")
+        self.btn_gen_veo.setStyleSheet("background-color: #7c3aed; color: white;")
+        self.btn_gen_veo.clicked.connect(self.generate_veo_assets)
+        v_layout.addWidget(self.btn_gen_veo)
+
+        v_layout.addWidget(QLabel("완성된 Flow/Veo 프롬프트 (클립보드 복사용):"))
+        self.output_veo_prompt = QTextEdit()
+        self.output_veo_prompt.setPlaceholderText("Gemini가 시네마틱 모션 프롬프트를 작성합니다...")
+        v_layout.addWidget(self.output_veo_prompt)
+
+        r_box.addWidget(grp_veo)
+        splitter.addWidget(right_box)
+        splitter.setSizes([850, 500])
+
+    def build_guide_tab(self):
+        """동영상 설명서 및 Veo 제작 가이드 탭"""
+        layout = QVBoxLayout(self.tab_guide)
+        layout.setContentsMargins(25, 20, 25, 20)
+
+        guide_viewer = QTextEdit()
+        guide_viewer.setReadOnly(True)
+        
+        # HTML 기반 깔끔한 설명서 서식
+        manual_html = """
+        <h2 style="color: #38bdf8;">🎬 Google Flow & Veo 기반 건축 동영상 제작 설명서</h2>
+        <p>본 렌더러에서 추출한 <b>시작/종료 이미지</b>와 <b>카메라 모션 프롬프트</b>를 Google Flow(Veo)에 입력하여 자연스러운 건축 시네마틱 비디오를 제작하는 공식 단계입니다.</p>
+        <hr style="border: 1px solid #332b4a;">
+
+        <h3 style="color: #f59e0b;">Step 1. 3D 뷰포트에서 카메라 동선(Keyframe) 잡기</h3>
+        <ul>
+            <li>마우스 드래그로 원하는 건축물의 <b>시작 각도</b>를 맞춘 후 <code>[1️⃣ 시작점(A) 등록]</code> 버튼을 누릅니다.</li>
+            <li>카메라를 부드럽게 이동시켜 <b>도착 각도</b>를 맞춘 후 <code>[2️⃣ 종료점(B) 등록]</code> 버튼을 누릅니다.</li>
+            <li><b>팁:</b> 각도 변화가 45도 내외이거나 일정한 방향(좌측 궤도 또는 전진 줌)일 때 영상의 붕괴(Hallucination) 없이 가장 완성도 높은 영상이 출력됩니다.</li>
+        </ul>
+
+        <h3 style="color: #f59e0b;">Step 2. 에셋 일괄 추출 및 Veo 프롬프트 생성</h3>
+        <ul>
+            <li>씬 콘셉트(외장재, 일조 상태 등)를 입력하고 <code>[Veo 비디오 프롬프트 & 이미지 추출]</code> 버튼을 누릅니다.</li>
+            <li>시스템이 자동으로 <b>start_frame.png</b>와 <b>end_frame.png</b>를 저장하며, Gemini가 3차원 이동 벡터를 분석해 영문 카메라 프롬프트를 하단 창에 완성합니다.</li>
+        </ul>
+
+        <h3 style="color: #f59e0b;">Step 3. Google Flow (Veo) 웹 콘솔에서 비디오 렌더링</h3>
+        <ol>
+            <li><b>Google Flow</b> 웹 콘솔에 접속하여 새 프로젝트를 생성합니다.</li>
+            <li><b>First Frame</b> 슬롯에 <code>start_frame.png</code> (또는 나노 바나나로 실사 변환한 시작컷)를 업로드합니다.</li>
+            <li><b>Last Frame</b> 슬롯에 <code>end_frame.png</code> (실사 변환된 종료컷)를 업로드합니다.</li>
+            <li>프롬프트 입력창에 앱에서 생성된 <b>영문 모션 프롬프트</b>를 그대로 붙여넣습니다.</li>
+            <li><b>Generate Video</b>를 누르면 약 1~2분 내로 부드러운 1080p/4K 건축 시네마틱 영상이 생성됩니다.</li>
+        </ol>
+
+        <h3 style="color: #38bdf8;">💡 Veo 카메라 모션 핵심 문법 사전</h3>
+        <table border="1" cellpadding="8" style="border-collapse: collapse; border-color: #332b4a; width: 100%;">
+            <tr style="background-color: #161220; color: #38bdf8;">
+                <th>동선 유형</th>
+                <th>추천 전문 키워드</th>
+                <th>시각적 효과</th>
+            </tr>
+            <tr>
+                <td><b>원형 궤도 (Orbit)</b></td>
+                <td>Smooth orbital arc shot, circling the modern villa clockwise</td>
+                <td>건물의 입체감과 외벽 재질을 360도로 웅장하게 보여줌</td>
+            </tr>
+            <tr>
+                <td><b>직선 전진 (Push-in)</b></td>
+                <td>Slow cinematic dolly-in towards the glass entrance, 24mm wide lens</td>
+                <td>시선이 메인 출입문이나 테라스로 빨려 들어가는 몰입감</td>
+            </tr>
+            <tr>
+                <td><b>상승 부감 (Crane Up)</b></td>
+                <td>Pedestal up shot slowly ascending to reveal the rooftop garden</td>
+                <td>지상 보행자 눈높이에서 옥상 조경 및 주변 환경 조망으로 확장</td>
+            </tr>
+        </table>
+        """
+        guide_viewer.setHtml(manual_html)
+        layout.addWidget(guide_viewer)
+
+    def record_keyframe(self, name):
+        cam = self.plotter.camera
+        pose = {
+            "position": tuple(cam.position),
+            "focal_point": tuple(cam.focal_point),
+            "view_up": tuple(cam.view_up)
+        }
+        if name.startswith("시작점"):
+            if len(self.keyframes) == 0:
+                self.keyframes.append(pose)
+            else:
+                self.keyframes[0] = pose
+        else:
+            if len(self.keyframes) < 2:
+                self.keyframes.append(pose)
+            else:
+                self.keyframes[1] = pose
+
+        self.lbl_cam_status.setText(f"등록 현황: {len(self.keyframes)} / 2 개 완료")
+
+    def generate_veo_assets(self):
+        if len(self.keyframes) < 2:
+            self.output_veo_prompt.setText("경고: 시작점(A)과 종료점(B)을 모두 등록해야 프롬프트 생성이 가능합니다.")
+            return
+
+        desc = self.input_scene.text().strip() or "Modern architecture villa with glass and concrete"
+        self.btn_gen_veo.setEnabled(False)
+        self.output_veo_prompt.setText("Gemini가 3D 카메라 궤적을 분석하여 Veo 맞춤형 프롬프트를 작성 중입니다...")
+
+        # 1. 시작 및 끝 프레임 캡처 저장
+        cam = self.plotter.camera
+        # 시작점 캡처
+        cam.position, cam.focal_point, cam.view_up = self.keyframes[0]["position"], self.keyframes[0]["focal_point"], self.keyframes[0]["view_up"]
+        self.plotter.render()
+        self.plotter.screenshot("start_frame.png")
+
+        # 종료점 캡처
+        cam.position, cam.focal_point, cam.view_up = self.keyframes[1]["position"], self.keyframes[1]["focal_point"], self.keyframes[1]["view_up"]
+        self.plotter.render()
+        self.plotter.screenshot("end_frame.png")
+
+        # 2. 비동기 워커로 Veo 프롬프트 요청
+        self.worker = VeoPromptWorker(self.keyframes[0], self.keyframes[1], desc)
+        self.worker.finished.connect(self.on_veo_finished)
+        self.worker.error.connect(lambda err: self.output_veo_prompt.setText(f"오류: {err}"))
+        self.worker.start()
+
+    def on_veo_finished(self, prompt):
+        self.btn_gen_veo.setEnabled(True)
+        final_text = (
+            f"{prompt}\n\n"
+            f"[추출 완료]\n"
+            f"✔ start_frame.png (First Frame 저장됨)\n"
+            f"✔ end_frame.png (Last Frame 저장됨)\n"
+            f"👉 상단 [Flow/Veo 비디오 제작 설명서] 탭을 열어 Flow 업로드 순서를 확인하세요."
+        )
+        self.output_veo_prompt.setText(final_text)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = ArchStudioWithGuide()
+    win.show()
+    sys.exit(app.exec_())
+
+//======================================
+
+구성의 장점
+직관적인 매뉴얼 내장: 별도 웹 브라우저나 문서를 찾아보지 않아도, 앱 상단 탭에서 'First/Last Frame 업로드 절차'와 '전문 카메라 모션 용어 표'를 언제든 열어볼 수 있습니다.
+
+3D 벡터의 자연어 번역: 사용자가 직접 복잡한 촬영 용어를 조합할 필요 없이, 마우스로 지정한 카메라 이동 궤적을 Gemini가 Veo가 이해하기 가장 좋은 형태로 자동 작성해 줍니다.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,1690 @@
+파이썬 오픈소스 라이브러리로 .skp 직접 파싱 (스케치업 변환 없이)
+스케치업 프로그램을 거치지 않고 파이썬 렌더러가 .skp 파일을 직접 읽게 만들려면, 오픈소스 SKP 파서인 openskp 라이브러리를 브리지로 사용합니다.
+
+Bash
+pip install openskp
+
+openskp를 사용하면 .skp 파일 내부의 레이어(태그) 이름, 컴포넌트 정의, 삼각형 메시 좌표를 파이썬 메모리로 직접 추출할 수 있습니다.
+
+Python
+from openskp import SkpFile
+import pyvista as pv
+import numpy as np
+
+def load_skp_to_pyvista(skp_path):
+    # 1. skp 바이너리 파싱
+    model = SkpFile.open(skp_path).parse()
+    print(f"SketchUp 버전: {model.version}")
+    print(f"발견된 레이어: {[l.name for l in model.layers]}")
+
+    # 2. GLB-ready 씬 그래프 빌드
+    scene = SkpFile.open(skp_path).build_scene()
+    
+    # 3. GLB/메시 프리미티브를 PyVista PolyData로 변환
+    actors = {}
+    for prim in scene.glb_primitives:
+        # 버텍스(x, y, z) 및 면(인덱스) 추출
+        vertices = np.array(prim.positions, dtype=np.float32)
+        indices = np.array(prim.indices, dtype=np.int32)
+        
+        # PyVista 면 구조 생성: [3, v1, v2, v3, 3, v4, v5, v6 ...]
+        faces = np.column_stack([np.full(len(indices)//3, 3), indices.reshape(-1, 3)]).ravel()
+        
+        mesh = pv.PolyData(vertices, faces)
+        mesh.compute_normals(inplace=True)
+        
+        layer_name = getattr(prim, "layer_name", "Default_Layer")
+        actors[layer_name] = mesh
+        
+    return actors
+
+
+개발 실무 가이드 요약
+openskp를 앱 백그라운드에 심어 사용자가 .skp 파일을 파일 열기 대화상자로 선택했을 때 자동으로 메모리 상에서 변환해 뷰포트에 띄우도록 파이프라인을 구성하면 됩니다.
+
+//==============================
+
+언랩 맵(UV Unwrapping Map)을 생성하고 여기에 AI/PBR 텍스처를 입혀 실제 언리얼 엔진이나 유니티 등에서 구동되는 게임 캐릭터 에셋으로 제작하는 파이프라인은 충분히 구현 가능합니다.
+
+게임 캐릭터 제작에서 핵심은 3D 입체 표면을 2D 전개도(UV Coordinate)로 펼치는 작업(Unwrap)과, 그 전개도 위에 알베도(Diffuse), 노멀(Normal), 러프니스(Roughness) 텍스처를 정렬하는 과정입니다.
+
+1. 게임 캐릭터용 파이프라인 전체 구조
+Plaintext
+[1. 3D 캐릭터 지오메트리 로드] (.obj / .3ds / .fbx)
+                │
+                ▼
+[2. 자동 UV 언랩(Unwrap) 엔진] (xatlas / Blender bpy / Trimesh)
+                │ 3D 정점(Vertex)을 2D UV 좌표(u, v)로 평면 전개
+                ▼
+[3. UV 와이어프레임 & 베이크(Bake) 추출]
+                │ UV Layout 맵, Normal 맵, AO(Ambient Occlusion) 맵 추출
+                ▼
+[4. Gemini/AI 기반 텍스처 생성 (Inpainting / Img2Img)]
+                │ 2D UV 레이아웃 가이드라인에 맞춰 캐릭터 의상, 피부, 장비 텍스처 합성
+                ▼
+[5. 실시간 PBR 검수 & 게임 엔진용 내보내기]
+                │ PyQt/PyVista 뷰포트에서 노멀/질감 확인 후 .fbx/.gltf 로 최종 익스포트
+2. 블렌더 없이 파이썬에서 자동 UV 언랩을 구현하는 방법
+게임 엔진에 넣으려면 반드시 메시마다 고유한 UV 좌표가 정의되어 있어야 합니다. 파이썬 환경에서 이를 자동화하는 오픈소스 라이브러리가 xatlas입니다.
+
+xatlas-python: 게임 업계에서 널리 쓰이는 고속 메시 파라미터화(UV Unwrapping & Packing) C++ 엔진의 파이썬 바인딩입니다.
+
+주요 역할:
+
+UV 좌표가 없는 원본 3D 캐릭터 메시를 입력받아, 면의 왜곡을 최소화하며 2D 평면 조각(UV Chart)으로 분할
+
+분할된 조각들을 0~1 텍스처 정사각형 공간에 겹치지 않게 패킹(Packing)
+
+Python
+import xatlas
+import trimesh
+import numpy as np
+
+# 1. UV 없는 캐릭터 메시 로드
+mesh = trimesh.load("character_base.obj")
+
+# 2. xatlas를 이용한 자동 UV 언랩 계산
+vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces)
+
+# 3. 언랩된 UV 데이터로 새 게임용 메시 생성
+unwrapped_mesh = trimesh.Trimesh(
+    vertices=mesh.vertices[vmapping],
+    faces=indices,
+    visual=trimesh.visual.TextureVisuals(uv=uvs)
+)
+
+# UV가 포함된 모델로 저장 (.obj)
+unwrapped_mesh.export("character_unwrapped.obj")
+3. UV 전개도 맵(UV Layout Map) 시각화 및 추출
+생성된 2D UV 좌표를 바탕으로 텍스처를 칠할 '전개도 밑그림'을 2D 이미지(PNG)로 렌더링합니다.
+
+Python
+import cv2
+
+def export_uv_layout_image(uvs, indices, img_size=2048):
+    """UV 전개도를 검은 배경에 흰색 와이어프레임 이미지로 렌더링"""
+    uv_canvas = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+    
+    # 0.0~1.0 사이의 UV 좌표를 픽셀 해상도로 스케일링
+    pixel_uvs = (uvs * [img_size - 1, img_size - 1]).astype(np.int32)
+    # 텍스처 좌표계는 V축이 아래에서 위로 가므로 Y축 뒤집기
+    pixel_uvs[:, 1] = (img_size - 1) - pixel_uvs[:, 1]
+
+    # 각 삼각형 면의 외곽선 그리기
+    for face in indices:
+        pts = pixel_uvs[face]
+        cv2.polylines(uv_canvas, [pts], isClosed=True, color=(180, 180, 180), thickness=1)
+
+    cv2.imwrite("uv_layout_map.png", uv_canvas)
+    return "uv_layout_map.png"
+4. 생성형 AI(나노 바나나 / Gemini)와 결합하는 실전 방식
+UV 언랩 맵을 AI에게 주고 바로 *"텍스처를 그려줘"*라고 하면 얼굴이 팔에 그려지는 등 위치가 어긋날 수 있습니다. 게임 캐릭터의 정밀도를 유지하려면 다음 두 가지 방식 중 하나를 사용합니다.
+
+방식 A. 3D 투영 텍스처링 (Projection Painting, 가장 권장)
+
+캐릭터를 3D 뷰포트 정면/측면/후면에서 각각 캡처합니다.
+
+AI(나노 바나나)로 정면/측면/후면 뷰의 의상 및 피부 디테일을 생성합니다.
+
+생성된 2D 이미지를 3D 표면의 UV 좌표계로 역투영(Baking)하여 최종 1장의 UV 텍스처 시트로 합성합니다.
+
+방식 B. UV 전개도 기반 ControlNet 인페인팅
+
+위에서 뽑은 uv_layout_map.png(전개도 윤곽선)를 ControlNet의 선화(Lineart) 가이드로 입력합니다.
+
+Gemini/나노 바나나 프롬프트에 *"PBR texture map for game character body, unwrapped texture layout, cyberpunk armor"*와 같이 지시하여 전개도 선 안에 텍스처가 채워지도록 유도합니다.
+
+5. 게임 엔진(Unreal / Unity) 사용 시 체크리스트
+폴리곤 수(Polycount) 최적화: 스케치업이나 건축용 캐드 파일은 게임용으로 쓰기에 불필요한 삼각형이 너무 많으므로, 언랩 전 mesh.simplify_quadric_decimation()을 통해 폴리곤을 줄이는 과정(리토폴로지)이 권장됩니다.
+
+PBR 채널 분리 저장:
+
+Base Color (RGB)
+
+Normal Map (탄젠트 공간, 푸른색 맵)
+
+Metallic & Roughness (단일 텍스처의 채널 패킹: R=AO, G=Roughness, B=Metallic)
+
+스켈레탈 리깅(Rigging): 캐릭터가 게임에서 뛰어다니거나 애니메이션을 재생하려면 텍스처 작업 이후 뼈대(Bone)와 가중치(Skin Weights)를 심어 .fbx로 내보내야 합니다.
+
+PyQt 기반 렌더러에 [1. 자동 UV 언랩 실행] → [2. UV 전개도 PNG 추출] → [3. AI 텍스처 입히기] 버튼을 단계별로 배치하면 독립형 캐릭터 텍스처링 툴로 확장할 수 있습니다.
+
+//==============================
+
+스케치업(.skp)은 직관적인 푸시/풀(Push/Pull) 방식으로 형태를 만들기 쉬워 캐릭터의 기본 형태(로우폴리곤 베이스 메시)를 빠르게 잡기에 좋습니다.
+
+다만 스케치업은 원래 건축/인테리어 툴이라 게임 캐릭터용 UV 언랩(전개도 펼치기) 기능이 기본 탑재되어 있지 않습니다.
+
+스케치업으로 만든 모델을 언랩 맵으로 변환하고 게임 캐릭터 텍스처를 입히는 실무 워크플로우를 단계별로 정리해 드립니다.
+
+1. 스케치업에서 캐릭터 모델링 시 필수 수칙
+게임 엔진이나 언랩 엔진으로 넘기기 전에 스케치업 안에서 다음 세 가지를 반드시 지켜야 합니다.
+
+반드시 '그룹(Group)' 또는 '컴포넌트(Component)'로 부위 묶기:
+
+몸통, 머리, 팔, 다리, 무기/장신구를 따로따로 그룹으로 만들어야 합니다. 그룹으로 묶지 않으면 면들이 서로 달라붙어 언랩 시 전개도가 심하게 꼬입니다.
+
+앞면(White)과 뒷면(Blue/Gray) 확인:
+
+스케치업 면의 푸른색(뒷면)이 밖으로 노출되면 게임 엔진이나 파이썬 렌더러에서 면이 투명하게 사라집니다. 뒤집힌 면은 우클릭 후 [면 반전(Reverse Faces)]을 눌러 항상 흰색(앞면)이 바깥을 향하게 해야 합니다.
+
+내보내기(Export):
+
+모델링 완료 후 파일(File) → 내보내기(Export) → 3D 모델(3D Model)을 누르고 .obj 파일로 저장합니다. (내보내기 옵션에서 그룹을 OBJ 그룹으로 내보내기 체크)
+
+2. 스케치업 내부에서 직접 언랩 맵(UV)을 만드는 루비(Ruby) 확장 기능
+스케치업 밖으로 나가지 않고 스케치업 자체에서 UV를 펴고 싶다면 전용 익스텐션(확장 루비)을 설치해 사용합니다.
+
+Wrap-R for SketchUp (유료/가장 추천):
+
+스케치업 창 안에서 이음매(Seam)를 마우스 클릭으로 자르고 1초 만에 깔끔한 2D UV 전개도 맵을 펴서 이미지로 내보내 줍니다.
+
+SketchUV (무료):
+
+구형, 원통형, 박스 매핑 등 기본 투영 UV를 스케치업 면에 입혀주는 클래식 무료 확장 도구입니다.
+
+3. 스케치업 모델을 파이썬 렌더러(PyQt)로 가져와 자동 언랩하는 파이프라인
+스케치업 유료 루비 없이, 앞서 개발한 파이썬/PyQt 렌더러 프로그램 안에서 원클릭으로 언랩 맵을 생성하도록 만드는 흐름입니다.
+
+Plaintext
+[스케치업 캐릭터 모델 (.obj로 내보내기)]
+                   │
+                   ▼
+[파이썬 자동 언랩 엔진 (xatlas)]
+  - 스케치업의 복잡한 폴리곤을 겹치지 않는 2D UV 전개도로 분할 및 패킹
+                   │
+                   ▼
+[UV Layout 맵 이미지 (uv_map.png) 자동 저장]
+  - 검은 배경에 흰색 선으로 캐릭터 전개도 윤곽선 추출
+                   │
+                   ▼
+[Gemini / 나노 바나나 기반 텍스처링]
+  - 전개도 가이드에 맞춰 피부, 갑옷, 옷감 텍스처를 칠함
+                   │
+                   ▼
+[PyVista 뷰포트에서 PBR 검수 후 게임 엔진(Unreal/Unity)으로 전송]
+4. 실제 파이썬 구현 코드 (스케치업 OBJ → UV 언랩 맵 추출)
+스케치업에서 내보낸 character.obj를 읽어 게임용 UV가 포함된 모델로 굽고, 전개도 PNG 이미지를 뽑아내는 핵심 함수입니다.
+
+Python
+import trimesh
+import xatlas
+import numpy as np
+import cv2
+
+def unwrap_sketchup_model(obj_path, output_obj_path="game_ready.obj", uv_img_path="uv_layout.png"):
+    # 1. 스케치업에서 내보낸 OBJ 로드
+    mesh = trimesh.load(obj_path, force='mesh')
+    
+    # 삼각화(Triangulation): 스케치업은 다각형(N-gon)이 섞여 있으므로 삼각형으로 정리
+    mesh = mesh.to_triangles()
+
+    # 2. xatlas를 통해 전자동 UV 언랩 (스케치업 면을 2D 좌표로 분해 및 패킹)
+    vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces)
+
+    # 3. 언랩된 UV 데이터를 담아 새 게임용 OBJ로 저장
+    unwrapped_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices[vmapping],
+        faces=indices,
+        visual=trimesh.visual.TextureVisuals(uv=uvs)
+    )
+    unwrapped_mesh.export(output_obj_path)
+    print(f"✔ 게임 엔진용 UV 매핑 모델 저장 완료: {output_obj_path}")
+
+    # 4. 텍스처를 칠할 수 있는 2D UV 전개도 맵(PNG) 추출
+    img_size = 2048
+    uv_canvas = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+    
+    pixel_uvs = (uvs * [img_size - 1, img_size - 1]).astype(np.int32)
+    pixel_uvs[:, 1] = (img_size - 1) - pixel_uvs[:, 1] # Y축 반전
+
+    for face in indices:
+        pts = pixel_uvs[face]
+        cv2.polylines(uv_canvas, [pts], isClosed=True, color=(200, 200, 200), thickness=1)
+
+    cv2.imwrite(uv_img_path, uv_canvas)
+    print(f"✔ AI 텍스처 페인팅용 UV 전개도 이미지 저장 완료: {uv_img_path}")
+
+# 사용 예시
+unwrap_sketchup_model("my_sketchup_character.obj")
+
+//============================
+
+5. 게임 캐릭터 완성 후 엔진 사용 시 주의사항
+스케치업으로 만든 모델은 뼈대(Bone)와 관절 애니메이션 정보가 없기 때문에 정지된 스태틱 메시(동상, 로봇, NPC 정지 모델)로 바로 쓸 수 있습니다.
+
+캐릭터가 뛰어다니게 만들려면, 위 코드로 추출한 game_ready.obj를 믹사모(Mixamo, 무료 자동 리깅 웹사이트)에 업로드하여 클릭 몇 번으로 관절 뼈대를 심고 달리기/점프 모션을 입혀 언리얼/유니티로 가져가면 됩니다.
+
+//============================
+
+스케치업 파일을 그대로 불러와서 작업 진행할꺼야. 
+루비 확장용처럼 파이써용 스케치업 모델 전용 UN WARP Map 프로그램
+
+//============================
+
+스케치업(.skp) 파일을 별도의 외부 포맷(obj, dae 등) 변환 없이 그대로 파이썬으로 불러와서, 스케치업 내부의 객체/그룹 구조를 보존한 채 게임 캐릭터용 UV Unwrapping Map을 자동 생성하고 PBR 텍스처를 입히는 독립형 파이썬 프로그램을 구축할 수 있습니다.
+
+블렌더나 스케치업 유료 루비 없이도 .skp 직접 파싱 라이브러리와 고속 자동 UV 언랩 엔진(xatlas)을 파이썬 스크립트로 브리지하면 구현 가능합니다.
+
+1. 전용 UNWARP 프로그램 구현 전략 (No Blender, No SketchUp Ruby)
+이 파이프라인의 핵심은 스케치업 바이너리 데이터를 직접 읽는 오픈소스 파서를 활용해 3D 지오메트리를 추출하고, 이를 게임 산업 표준의 자동 언랩 알고리즘에 넣는 것입니다.
+
+핵심 구성 모듈 (파이썬)
+.skp 바이너리 직접 로드: openskp (스케치업 파일 파싱)
+
+3D 지오메트리 조작 & 변환: trimesh 또는 pyvista (NumPy 연동)
+
+전자동 UV 언랩 엔진: xatlas-python (최적화된 전개도 전개 및 패킹)
+
+텍스처 맵 시각화 및 내보내기: cv2 (OpenCV)
+
+2. 완성형 파이썬 스크립트: .skp 로드 및 자동 UV 언랩 맵 추출
+이 코드는 사용자가 지정한 .skp 파일을 메모리 상으로 읽어 삼각형 메시로 정리하고, 이를 xatlas 엔진에 넣어 겹치지 않는 2D UV 전개도 좌표를 생성한 뒤, .obj(게임용 모델) 및 .png(전개도 윤곽선 맵)로 즉시 추출합니다.
+
+# 필수 라이브러리 설치
+pip install openskp trimesh xatlas opencv-python numpy pyvistaqt
+
+import os
+import sys
+import numpy as np
+import cv2
+from openskp import SkpFile
+import trimesh
+import xatlas
+
+class SketchUpUvStudio:
+    def __init__(self, skp_file_path):
+        self.skp_file_path = skp_file_path
+        self.filename = os.path.splitext(os.path.basename(skp_file_path))[0]
+        self.raw_meshes = []
+        self.final_mesh = None
+
+    def load_skp_file(self):
+        """1단계: .skp 바이너리 파일을 직접 파싱하여 3D 지오메트리 추출"""
+        print(f"📖 스케치업 파일 로드 중: {self.skp_file_path}")
+        
+        try:
+            # openskp를 이용해 메모리에 스케치업 씬 구축
+            scene = SkpFile.open(self.skp_file_path).build_scene()
+            
+            # 씬 내부의 GLB 프리미티브(메시 조각)를 수집
+            for prim in scene.glb_primitives:
+                # 버텍스 및 인덱스 데이터를 NumPy 배열로 변환
+                vertices = np.array(prim.positions, dtype=np.float32)
+                indices = np.array(prim.indices, dtype=np.int32)
+                
+                # Trimesh 메시 조각 생성
+                mesh_part = trimesh.Trimesh(vertices=vertices, faces=indices.reshape(-1, 3))
+                
+                # 스케치업의 N-gon 다각형을 삼각형으로 정리 (게임 엔진 호환)
+                mesh_part = mesh_part.to_triangles()
+                self.raw_meshes.append(mesh_part)
+                
+            # 여러 파트의 메시를 하나의 통짜 메시로 결합
+            self.final_mesh = trimesh.util.concatenate(self.raw_meshes)
+            self.final_mesh.remove_degenerate_faces(inplace=True)
+            self.final_mesh.remove_duplicate_faces(inplace=True)
+            
+            print(f"✔ 스케치업 지오메트리 로드 완료 (총 폴리곤: {len(self.final_mesh.faces)})")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 오류 발생 (파일 로드 실패): {str(e)}")
+            return False
+
+    def generate_uv_unwrap_map(self):
+        """2단계: xatlas 엔진을 통한 전자동 고속 UV Unwrapping 및 Packing"""
+        if self.final_mesh is None: return False
+        print("⚡ 고속 자동 UV 언랩 실행 중 (xatlas)...")
+        
+        # xatlas parametrize를 통한 UV 전개도 좌표 및 인덱스 계산
+        # (3D 정점을 왜곡 없이 2D 평면으로 전개하고 패킹하는 과정)
+        vmapping, indices, uvs = xatlas.parametrize(self.final_mesh.vertices, self.final_mesh.faces)
+        
+        # 3단계: UV 좌표가 포함된 새 게임용 메시 구성
+        game_mesh = trimesh.Trimesh(
+            vertices=self.final_mesh.vertices[vmapping],
+            faces=indices,
+            visual=trimesh.visual.TextureVisuals(uv=uvs)
+        )
+        # 게임 엔진 및 AI 텍스처링에 표준인 .obj 로 저장
+        output_obj = f"{self.filename}_game_ready.obj"
+        game_mesh.export(output_obj)
+        print(f"✔ UV가 포함된 게임용 OBJ 모델 저장 완료: {output_obj}")
+        
+        # 4단계: 텍스처를 칠할 수 있는 2D UV Layout 맵 (PNG) 추출
+        self._export_uv_wireframe_map(uvs, indices)
+        return True
+
+    def _export_uv_wireframe_map(self, uvs, indices, img_size=2048):
+        """AI/PBR 텍스처 페인팅 가이드용 2D UV 전개도 윤곽선 맵 생성"""
+        uv_canvas = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+        
+        # 0.0~1.0의 UV 좌표를 픽셀 해상도로 스케일링
+        pixel_uvs = (uvs * [img_size - 1, img_size - 1]).astype(np.int32)
+        # 텍스처 좌표계는 V축이 아래에서 위로 가므로 Y축 뒤집기 (OpenCV 이미지 좌표계와 일치)
+        pixel_uvs[:, 1] = (img_size - 1) - pixel_uvs[:, 1]
+
+        # 각 삼각형 면의 외곽선 그리기 (밑그림 와이어프레임)
+        for face in indices:
+            pts = pixel_uvs[face]
+            cv2.polylines(uv_canvas, [pts], isClosed=True, color=(180, 180, 180), thickness=1)
+
+        output_png = f"{self.filename}_uv_map.png"
+        cv2.imwrite(output_png, uv_canvas)
+        print(f"✔ AI 텍스처 페인팅 가이드용 UV 전개도 저장 완료: {output_png}")
+
+if __name__ == "__main__":
+    # 스케치업 캐릭터 파일 경로 지정
+    sketchup_file = "my_sketchup_character.skp"
+    
+    # 스튜디오 인스턴스 생성
+    studio = SketchUpUvStudio(sketchup_file)
+    
+    # 파이프라인 순차 실행
+    if studio.load_skp_file():
+        studio.generate_uv_unwrap_map()
+
+//===================================
+
+3. PyQt 렌더러 통합 및 확장 (실무 워크플로우)
+위 코드를 독립적인 실행 모듈로 만들고, 앞서 논의한 PyQt/PyVista 렌더러 앱에 [Load SketchUp] 및 [Generate UV Map] 버튼을 추가하여 연결합니다.
+
+사용자 UI: 사용자가 앱에서 *.skp 파일을 선택합니다.
+
+백그라운드 처리: 위 load_skp_file 함수가 실행되어 지오메트리를 추출하고 generate_uv_unwrap_map이 xatlas를 호출해 원클릭으로 언랩을 완료합니다.
+
+결과 시각화:
+
+좌측 뷰포트: UV가 언랩된 캐릭터 메시(_game_ready.obj)를 로드하여 PBR 모드로 표시합니다.
+
+우측 챗봇/이미지 패널: 생성된 _uv_map.png(전개도 윤곽선)를 띄워 AI 텍스처링 가이드로 삼습니다.
+
+4. 게임 캐릭터 제작 시 주의점 (스케치업 기반)
+폴리곤 최적화 (Simplify): 스케치업은 삼각형이 너무 많은 다각형 메시(N-gon)를 생성하는 경향이 있어 게임 엔진용으로 너무 무거울 수 있습니다. xatlas 실행 전 mesh.simplify_quadric_decimation()을 통해 삼각형 개수를 게임 엔진 목표치로 줄이는 과정을 추가하는 것이 좋습니다.
+
+믹사모(Mixamo) 자동 리깅: 추출된 _game_ready.obj 모델은 뼈대와 관절 정보가 없는 정지된 모델입니다. 뛰어다니는 캐릭터를 만들려면, 저장된 OBJ 모델을 Adobe Mixamo 웹사이트에 업로드하여 자동 리깅(뼈대 이식)을 거쳐 .fbx로 저장하면 됩니다.
+
+나노 바나나(Gemini Image) 텍스처링: 추출된 _uv_map.png를 AI에게 입력 가이드(Img2Img 또는 ControlNet Lineart)로 주고 "PBR texture map for game character body, unwrapped texture layout, cyberpunk style armor" 프롬프트로 텍스처를 채웁니다.
+
+//==========================================
+
+현재 스케치업 파일을 불러오는것은 성공했거든
+
+//==========================================
+
+스케치업(.skp) 모델을 파이썬 환경으로 직접 불러오는 데 성공했으므로, 가장 까다로운 첫 관문이 해결되었습니다.
+
+이제 스케치업에서 가져온 지오메트리를 '게임용 캐릭터 에셋'으로 완성하기 위한 다음 핵심 작업은 xatlas 기반 자동 UV 언랩 및 전개도(UV Layout Map) 추출입니다.
+
+불러온 지오메트리 데이터를 바로 언랩 파이프라인에 연결하는 핵심 3단계를 점검하고 진행하면 됩니다.
+
+다음 단계: UV 언랩 및 전개도 추출 파이프라인
+Plaintext
+[스케치업 메시 로드 성공]
+          │
+          ▼
+[1. 지오메트리 전처리] (삼각화 + 중복 정점 용접)
+          │
+          ▼
+[2. xatlas 자동 언랩 실행] (3D 면 → 2D UV 좌표 생성 및 패킹)
+          │
+          ▼
+[3. 출력물 2종 생성]
+   ├─ ① UV 좌표가 심어진 게임용 모델 (.obj 또는 .glb)
+   └─ ② AI 텍스처 페인팅용 2D 전개도 이미지 (.png)
+즉시 적용할 수 있는 UV 언랩 모듈
+불러온 데이터가 trimesh.Trimesh 객체 형태이거나 정점/면(NumPy 배열) 형태라면, 아래 코드로 바로 넘겨 처리할 수 있습니다.
+
+Python
+import xatlas
+import trimesh
+import numpy as np
+import cv2
+
+def process_uv_unwrap(mesh: trimesh.Trimesh, save_prefix="character"):
+    """
+    스케치업에서 추출된 trimesh 객체를 받아
+    xatlas로 UV를 언랩하고 게임용 OBJ와 전개도 PNG를 생성합니다.
+    """
+    # 1. 전처리: 스케치업 특유의 N-gon을 순수 삼각형으로 강제 변환 및 결함 제거
+    mesh = mesh.to_triangles()
+    mesh.remove_duplicate_faces(inplace=True)
+    mesh.remove_degenerate_faces(inplace=True)
+
+    print(f"정점 수: {len(mesh.vertices)}, 면 수: {len(mesh.faces)}")
+    print("xatlas 자동 언랩 및 2D 패킹 계산 중...")
+
+    # 2. xatlas 고속 언랩 실행
+    vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces)
+
+    # 3. UV 데이터가 내장된 게임용 Trimesh 생성 및 저장
+    unwrapped_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices[vmapping],
+        faces=indices,
+        visual=trimesh.visual.TextureVisuals(uv=uvs)
+    )
+    obj_path = f"{save_prefix}_game_ready.obj"
+    unwrapped_mesh.export(obj_path)
+    print(f"✔ 게임 엔진용 모델 저장 완료: {obj_path}")
+
+    # 4. AI 텍스처링 및 검수용 2D UV 전개도 맵(2048x2048 PNG) 렌더링
+    img_size = 2048
+    uv_canvas = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+
+    # UV 좌표(0.0~1.0)를 픽셀 단위로 스케일링 (Y축 반전 처리)
+    pixel_uvs = (uvs * [img_size - 1, img_size - 1]).astype(np.int32)
+    pixel_uvs[:, 1] = (img_size - 1) - pixel_uvs[:, 1]
+
+    for face in indices:
+        pts = pixel_uvs[face]
+        cv2.polylines(uv_canvas, [pts], isClosed=True, color=(200, 200, 200), thickness=1)
+
+    uv_img_path = f"{save_prefix}_uv_layout.png"
+    cv2.imwrite(uv_img_path, uv_canvas)
+    print(f"✔ 2D 전개도 이미지 저장 완료: {uv_img_path}")
+
+    return obj_path, uv_img_path
+
+
+현재 스케치업 데이터를 어떤 형식(예: openskp의 프리미티브, trimesh, 또는 PyVista.PolyData)으로 받아오셨는지 알려주시면, 그 데이터 타입에 맞춰 곧바로 위 언랩 함수와 연결해 드리겠습니다.
+
+//==================================
+
+스케치업에서 그룹별로 저장하면 불러올때 계층별 인식해서 보여줘야 하고 1차로 각각 의 요소를 UV Maping 해야지?
+
+//==================================
+
+스케치업에서 그룹(Group)이나 컴포넌트(Component)로 작업한 모델은 계층 구조(트리 구조)를 그대로 인식해야 하고, UV 언랩 역시 각 요소(파트)별로 독립적으로 언랩한 뒤 텍스처 아틀라스(Atlas)로 패킹하는 것이 정석입니다.
+
+만약 전체를 하나의 덩어리로 뭉쳐서 언랩하면 머리, 몸통, 무기의 면들이 엉망으로 섞여 게임 엔진에서 부위별 제어가 불가능해집니다.
+
+1. 계층별 파이프라인 흐름 (그룹 인식 → UV 맵핑)
+스케치업 계층(Hierarchy) 파싱:
+
+스케치업의 트리 구조(예: Character ➔ Head, Body, Armor, Weapon)를 읽어와 PyQt의 QTreeWidget에 그대로 띄웁니다.
+
+1차 개별 파트별 UV 언랩 (Per-Part Unwrapping):
+
+각 그룹 메시(Mesh)를 독립된 개체로 다루어 왜곡 없는 2D UV 평면 전개도를 각각 계산합니다.
+
+2차 통합 패킹 (Texture Atlas Packing):
+
+게임 엔진 최적화를 위해 머리, 몸통, 무기 등의 전개도 조각(UV Islands)들을 단 1장의 2048x2048 정사각형 타일(UV Space 0~1) 안에 겹치지 않게 오밀조밀 배치(Packing)합니다.
+
+결과:
+
+단 1장의 텍스처 맵으로 캐릭터 전체를 커버하면서도, 게임 엔진이나 뷰어에서는 부위별(머리/몸통/무기)로 선택하고 제어할 수 있게 됩니다.
+
+2. PyQt 트리뷰 연동 및 계층별 자동 UV 언랩 코드
+스케치업의 그룹/컴포넌트 리스트를 PyQt 트리에 보여주고, 버튼 클릭 시 각 그룹을 인식해 개별 언랩 후 통합 패킹하는 핵심 구현입니다.
+
+
+import sys
+import numpy as np
+import trimesh
+import xatlas
+import cv2
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTreeWidget, QTreeWidgetItem, QPushButton, QLabel, QTextEdit, QSplitter
+)
+from PyQt5.QtCore import Qt
+
+class HierarchyUVStudio(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("스케치업 그룹 계층 인식 및 멀티 파트 UV 언랩퍼")
+        self.resize(1100, 700)
+
+        # 스케치업에서 파싱된 그룹별 메시 저장소 { "그룹명": trimesh.Trimesh }
+        self.parts_dict = {}
+
+        # 메인 레이아웃 (스플리터)
+        splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(splitter)
+
+        # [좌측] 계층 구조 트리 패널
+        left_widget = QWidget()
+        l_layout = QVBoxLayout(left_widget)
+        l_layout.addWidget(QLabel("<b>[스케치업 객체 계층 구조 (Outliner)]</b>"))
+
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setHeaderLabels(["객체 / 그룹명", "폴리곤 수"])
+        l_layout.addWidget(self.tree_widget)
+
+        self.btn_load_sample = QPushButton("스케치업 그룹 데이터 로드 (샘플)")
+        self.btn_load_sample.clicked.connect(self.load_sketchup_groups)
+        l_layout.addWidget(self.btn_load_sample)
+
+        self.btn_run_unwrap = QPushButton("⚡ 계층별 UV 언랩 & 아틀라스 패킹 실행")
+        self.btn_run_unwrap.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 10px;")
+        self.btn_run_unwrap.clicked.connect(self.execute_hierarchical_unwrap)
+        l_layout.addWidget(self.btn_run_unwrap)
+
+        splitter.addWidget(left_widget)
+
+        # [우측] 로그 및 처리 결과 창
+        right_widget = QWidget()
+        r_layout = QVBoxLayout(right_widget)
+        r_layout.addWidget(QLabel("<b>[처리 로그 및 UV 상태]</b>"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        r_layout.addWidget(self.log_box)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([450, 650])
+
+    def load_sketchup_groups(self):
+        """스케치업에서 그룹화된 캐릭터 부위들을 가져와 트리에 나열 (예시 데이터)"""
+        self.tree_widget.clear()
+        self.parts_dict.clear()
+
+        # 예시: 스케치업에서 그룹으로 묶인 캐릭터 파트들 생성
+        root_item = QTreeWidgetItem(self.tree_widget, ["Character_Root", ""])
+        
+        parts_data = {
+            "Head_Group": trimesh.creation.icosphere(subdivisions=2, radius=1.0),
+            "Body_Torso": trimesh.creation.box(extents=[1.5, 1.0, 2.0]),
+            "Arm_L": trimesh.creation.cylinder(radius=0.3, height=1.5),
+            "Arm_R": trimesh.creation.cylinder(radius=0.3, height=1.5),
+            "Weapon_Sword": trimesh.creation.box(extents=[0.2, 0.5, 3.0])
+        }
+
+        for name, mesh in parts_data.items():
+            self.parts_dict[name] = mesh
+            # 트리에 등록
+            item = QTreeWidgetItem(root_item, [name, f"{len(mesh.faces)} Tris"])
+            item.setCheckState(0, Qt.Checked)
+
+        self.tree_widget.expandAll()
+        self.log_box.append("✔ 스케치업 그룹 계층 파싱 완료: 총 5개 파트 감지됨.")
+
+    def execute_hierarchical_unwrap(self):
+        """계층별 그룹을 xatlas에 일괄 등록하여 통합 UV Atlas 맵 생성"""
+        if not self.parts_dict:
+            self.log_box.append("⚠ 로드된 그룹 데이터가 없습니다.")
+            return
+
+        self.log_box.append("\n[1단계] 각 파트별 독립 메시 정밀 삼각화...")
+        atlas = xatlas.Atlas()
+
+        part_names = list(self.parts_dict.keys())
+        for name in part_names:
+            mesh = self.parts_dict[name].to_triangles()
+            # xatlas 차트에 각 그룹 메시를 독립된 파트로 등록
+            atlas.add_mesh(mesh.vertices, mesh.faces)
+            self.log_box.append(f" - [{name}] UV 차트 등록 완료")
+
+        self.log_box.append("\n[2단계] xatlas 글로벌 파라미터라이징 & 단일 텍스처 패킹 계산 중...")
+        # 파트별로 겹치지 않게 하나의 0~1 공간에 패킹
+        atlas.generate()
+
+        self.log_box.append(f"✔ 언랩 완료: 총 {atlas.chart_count}개 아일랜드 생성됨")
+
+        # [3단계] 통합 UV Layout 맵 (PNG) 렌더링
+        self.render_atlas_map(atlas, part_names)
+
+    def render_atlas_map(self, atlas, part_names, img_size=2048):
+        """각 파트별로 색상을 다르게 칠하여 전개도 이미지로 저장 (부위 식별용)"""
+        canvas = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+
+        # 파트 구분을 위한 색상 팔레트 (RGB)
+        colors = [
+            (0, 255, 255),  # Yellow - Head
+            (0, 200, 0),    # Green - Body
+            (255, 100, 0),  # Blue - Arm_L
+            (255, 0, 200),  # Magenta - Arm_R
+            (0, 0, 255)     # Red - Weapon
+        ]
+
+        self.log_box.append("\n[3단계] 부위별 색상 구분 2D UV Layout PNG 생성 중...")
+
+        for i, mesh_output in enumerate(atlas):
+            part_name = part_names[i]
+            color = colors[i % len(colors)]
+
+            uvs = mesh_output.uv
+            indices = mesh_output.indices
+
+            # UV 좌표 픽셀 변환
+            pixel_uvs = (uvs * [img_size - 1, img_size - 1]).astype(np.int32)
+            pixel_uvs[:, 1] = (img_size - 1) - pixel_uvs[:, 1] # Y축 반전
+
+            for face in indices:
+                pts = pixel_uvs[face]
+                cv2.polylines(canvas, [pts], isClosed=True, color=color, thickness=1)
+
+            self.log_box.append(f" - {part_name}: UV 아일랜드 맵핑 완료 (Color Marker 적용)")
+
+        output_filename = "character_atlas_uv_map.png"
+        cv2.imwrite(output_filename, canvas)
+        self.log_box.append(f"\n🎉 <b>최종 전개도 생성 완료: {output_filename}</b>")
+        self.log_box.append("👉 이제 AI(나노 바나나/Gemini)에게 이 전개도를 넘겨 텍스처를 생성할 수 있습니다.")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = HierarchyUVStudio()
+    win.show()
+    sys.exit(app.exec_())
+
+
+//===================================
+
+이렇게 계층별로 처리했을 때의 실무적 이점
+AI 텍스처링의 정확도 상승 (부위별 식별):
+
+위 코드처럼 전개도 생성 시 파트별로 다른 색상(머리는 노랑, 몸통은 초록, 무기는 빨강)의 선으로 윤곽을 그려두면, AI가 *"노란색 구역은 얼굴 피부, 초록색 구역은 가죽 갑옷, 빨간색 구역은 강철 검"*으로 영역을 정확히 인지하여 텍스처를 칠할 수 있습니다.
+
+게임 엔진에서의 모듈화 (부품 교체 가능):
+
+게임 엔진(언리얼/유니티)으로 가져갔을 때, 캐릭터 몸체는 그대로 두고 무기(Weapon) 머티리얼만 교체하거나 갑옷 파츠만 다른 장비로 갈아끼우는 시스템을 쉽게 구축할 수 있습니다.
+
+
+//===================================
+
+객체 요소별 Uv map을 하고 조명을 설치해서 그림자를 만들고 그림자가 모델 객체에 생성되면 그 그림자요소가 UnWARP Map에 적용되게 Unity 3D 방식처럼 베이크 할 수 있어?
+
+//===================================
+
+게임 그래픽과 3D 렌더링에서 완벽히 표준적인 라이트맵 베이킹(Lightmap Baking) 방식입니다.Unity 3D나 Unreal Engine에서 사용하는 "Bake Lightmaps" 기능의 내부 원리와 동일하게, 파이썬 환경에서도 레이트레이싱(Ray-tracing)이나 섀도우 버퍼(Shadow Buffer)를 통해 그림자 연산을 수행한 뒤 이를 2D 전개도(UV 맵)의 픽셀에 기록(Baking)할 수 있습니다.1. 그림자 베이킹(Shadow Baking)의 동작 원리유니티 엔진 내부에서 일어나는 베이킹 과정은 다음과 같으며, 파이썬에서도 동일한 수학적 흐름으로 처리됩니다.UV 공간 래스터화: 2D 전개도(UV 이미지)의 각 픽셀(예: $2048 \times 2048$)이 3D 모델 상의 어느 위치(World Position)와 법선 벡터(Normal)에 해당하는지 계산합니다.광선 추적 (Ray-casting / Shadow Test):해당 3D 지점에서 조명(Light Source) 위치로 가상의 광선을 쏩니다.광선 중간에 다른 객체(예: 머리 때문에 가려지는 목, 무기 때문에 가려지는 몸통 등)가 가로막고 있으면 그림자(Shadow = 0.0, 어두움)로 판정합니다.가로막는 것이 없다면 광원과 표면 법선의 각도에 따라 빛(Diffuse Light = 밝음)을 계산합니다.UV 텍스처로 기록(Bake): 계산된 명암/그림자 값을 2D 이미지의 해당 UV 픽셀 위치에 색상(Black & White 또는 앰비언트 오클루전)으로 기록하여 파일(shadow_bake.png)로 저장합니다.2. 파이썬 기반 고속 그림자 베이킹 구현 코드별도의 상용 툴(Unity, Blender) 없이 파이썬의 고속 3D 라이브러리인 trimesh의 Ray 연산 엔진(Embree 기반)을 사용해 UV 맵에 그림자를 굽는(Bake) 핵심 코드입니다.
+
+
+import numpy as np
+import trimesh
+import cv2
+
+def bake_shadow_map(mesh: trimesh.Trimesh, uvs: np.ndarray, faces: np.ndarray, 
+                    light_pos=np.array([5.0, 10.0, 5.0]), img_size=1024):
+    """
+    Unity의 Lightmap Baking 원리와 동일하게
+    광원에서 오는 빛의 차폐(그림자)를 계산하여 2D UV 맵에 굽습니다.
+    """
+    print("⚡ 조명 배치 및 그림자 레이트레이싱 베이킹 시작...")
+    
+    # 1. 2D UV 맵을 담을 캔버스 준비 (흰색=완전 밝음, 검은색=그림자)
+    bake_canvas = np.ones((img_size, img_size), dtype=np.float32)
+    
+    # Ray 엔진 준비 (3D 충돌 감지)
+    ray_intersector = mesh.ray
+
+    # 2. 각 삼각형 면마다 UV 좌표를 픽셀로 변환하고 3D 좌표와 매핑
+    for face_idx, face in enumerate(faces):
+        # 3D 정점 및 해당 면의 UV 정점
+        pts_3d = mesh.vertices[face]
+        pts_uv = uvs[face]
+
+        # UV 좌표를 픽셀 단위로 변환 (0~1 -> 0~img_size)
+        px_uv = (pts_uv * [img_size - 1, img_size - 1]).astype(np.int32)
+        px_uv[:, 1] = (img_size - 1) - px_uv[:, 1] # Y축 반전
+
+        # 각 면의 중심점(Centroid) 계산
+        center_3d = np.mean(pts_3d, axis=0)
+        face_normal = mesh.face_normals[face_idx]
+
+        # 면의 중심에서 조명으로 향하는 벡터 및 거리
+        light_dir = light_pos - center_3d
+        distance_to_light = np.linalg.norm(light_dir)
+        ray_dir = light_dir / distance_to_light
+
+        # 조명 각도 계산 (Lambertian N·L)
+        dot_product = np.dot(face_normal, ray_dir)
+        
+        # 기본 명암 계산 (면이 빛을 등지고 있으면 기본 그림자)
+        if dot_product <= 0:
+            shadow_factor = 0.2 # 앰비언트(환경광) 최소 밝기
+        else:
+            # 면 표면에서 미세하게 띄워서 광선 발사 (Self-intersection 방지)
+            ray_origin = center_3d + (face_normal * 0.001)
+            
+            # 조명 방향으로 광선을 쏴서 다른 객체에 부딪히는지 검사 (차폐 검사)
+            locations, index_ray, index_tri = ray_intersector.intersects_location(
+                ray_origins=[ray_origin],
+                ray_directions=[ray_dir]
+            )
+
+            # 조명보다 가까운 곳에 장애물이 있다면 -> 그림자 영역!
+            is_occluded = False
+            for hit_pt in locations:
+                if np.linalg.norm(hit_pt - ray_origin) < distance_to_light:
+                    is_occluded = True
+                    break
+            
+            if is_occluded:
+                shadow_factor = 0.25 # 그림자 영역 어둡게
+            else:
+                shadow_factor = min(1.0, 0.25 + 0.75 * dot_product) # 빛을 직접 받는 밝은 영역
+
+        # 3. 계산된 그림자/명암 값을 2D UV 전개도 면 영역에 채우기
+        triangle_contour = np.array([px_uv], dtype=np.int32)
+        cv2.fillPoly(bake_canvas, pts=triangle_contour, color=float(shadow_factor))
+
+    # 4. 이미지로 저장 (0~255 스케일링)
+    baked_image = (bake_canvas * 255).astype(np.uint8)
+    # 가장자리 계단 현상 완화를 위한 가우시안 블러
+    baked_image = cv2.GaussianBlur(baked_image, (3, 3), 0)
+    
+    cv2.imwrite("baked_shadow_lightmap.png", baked_image)
+    print("✔ 그림자 베이크 완료! 저장 파일: baked_shadow_lightmap.png")
+    return baked_image
+
+//======================================
+
+이렇게 베이크된 그림자 맵의 활용 방식
+베이킹된 그림자 맵(baked_shadow_lightmap.png)은 게임 캐릭터 제작에서 다음과 같이 다양하게 결합할 수 있습니다.
+
+Unity/Unreal 엔진의 Lightmap 슬롯 연결:
+
+게임 엔진의 머티리얼 설정에서 Lightmap / AO(Ambient Occlusion) 맵 슬롯에 그대로 드래그하여 적용하면, 엔진 내에서 실시간 조명을 무겁게 켜지 않아도 자연스러운 고정 그림자가 연출되어 모바일 기기에서도 매우 가볍게 구동됩니다.
+
+AI 텍스처링(나노 바나나/Gemini)과의 합성:
+
+AI가 그려준 원본 알베도(컬러) 텍스처 위에 이 그림자 맵을 포토샵의 '곱하기(Multiply)' 모드처럼 파이썬(cv2.multiply)으로 합성하면, 실제 3D 모델의 굴곡과 조명 위치에 완벽히 일치하는 그림자가 캐릭터 옷 주름과 얼굴 턱 밑에 자연스럽게 새겨진 텍스처가 완성됩니다.
+
+PBR의 AO(Ambient Occlusion) 맵으로 자동 전환:
+
+조명을 한 방향이 아니라 사방(전방위 반구)에서 조사하도록 설정하면 유니티의 AO Bake와 동일한 부드러운 구석진 곳의 음영(Ambient Occlusion) 맵을 얻을 수 있습니다.
+
+//======================================
+
+객체 요소에 라이트 효과와 그림자 베이크까지 했으면 polygon에 UN WARP Map 옷을 입혀야 되지? 자동으로 옷을 입힐 수 있어?
+
+//======================================
+
+3D 폴리곤에 2D 언랩 맵(UV Unwrapping Map) 텍스처를 입히는 과정(Texture Binding)은 UV 좌표 매핑 규칙에 따라 100% 자동 적용할 수 있습니다.
+
+베이크 단계에서 생성된 UV 좌표(u, v)가 이미 폴리곤 버텍스마다 1:1로 각인되어 있기 때문에, 파이썬 코드 상에서 텍스처 이미지를 해당 폴리곤 지오메트리의 텍스처 채널에 연결(Bind)하기만 하면 즉시 피팅됩니다.
+
+자동 텍스처 매핑의 동작 메커니즘
+Plaintext
+[1. AI 텍스처 생성] (Gemini/Nano Banana: 베이스 컬러 의상 패턴)
+          │
+          ▼
+[2. 그림자 합성 (Bake Blend)]
+          │  Base Texture  ✕  Baked Shadow Map (Multiply)
+          ▼
+[3. 최종 텍스처 맵 완성] (final_clothed_texture.png)
+          │
+          ▼
+[4. 폴리곤 메시 UV 바인딩 (Auto-Skinning)]
+          │  Trimesh / PyVista 액터에 텍스처 주입
+          ▼
+[5. 실시간 3D 뷰포트 PBR 렌더링 검수]
+파이썬 자동 텍스처 바인딩 코드
+AI가 생성한 의상 텍스처와 앞서 베이킹한 그림자 맵을 자동 합성한 뒤, 3D 캐릭터 폴리곤 메시에 즉시 입혀 뷰포트에 띄우는 함수입니다.
+
+
+import cv2
+import numpy as np
+import pyvista as pv
+import trimesh
+
+def auto_apply_clothed_texture(game_mesh: trimesh.Trimesh, 
+                               base_cloth_path="ai_generated_clothing.png", 
+                               shadow_bake_path="baked_shadow_lightmap.png",
+                               output_tex_path="final_clothed_diffuse.png"):
+    """
+    1. 생성된 의상 텍스처와 베이킹된 그림자 맵을 곱하기(Multiply)로 합성
+    2. UV 좌표를 가진 폴리곤 메시에 텍스처를 자동 바인딩하여 저장 및 렌더링
+    """
+    # 1. 텍스처 이미지 로드
+    cloth_img = cv2.imread(base_cloth_path)
+    shadow_img = cv2.imread(shadow_bake_path)
+
+    # 크기 일치 확인 (예: 2048x2048)
+    if cloth_img.shape != shadow_img.shape:
+        shadow_img = cv2.resize(shadow_img, (cloth_img.shape[1], cloth_img.shape[0]))
+
+    # 2. 그림자 합성 (Multiply Blend): 의상 색상 위에 굴곡/그림자 투영
+    # 공식: (Cloth * Shadow) / 255.0
+    cloth_norm = cloth_img.astype(np.float32) / 255.0
+    shadow_norm = shadow_img.astype(np.float32) / 255.0
+    blended = (cloth_norm * shadow_norm) * 255.0
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
+
+    # 합성된 최종 의상 텍스처 저장
+    cv2.imwrite(output_tex_path, blended)
+    print(f"✔ 그림자가 적용된 최종 의상 맵 생성: {output_tex_path}")
+
+    # 3. Trimesh 객체에 텍스처 바인딩 및 저장
+    # 기존에 xatlas로 추출된 UV 좌표(uvs)가 game_mesh.visual.uv 에 존재함
+    material = trimesh.visual.texture.SimpleMaterial(
+        image=cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+    )
+    game_mesh.visual.material = material
+    
+    # 게임 엔진용 표준 .glb 또는 .obj로 내보내기 (텍스처 완전 내장)
+    game_mesh.export("character_ready_to_play.glb")
+    print("✔ 게임 엔진(Unreal/Unity) 즉시 사용 가능한 GLB 파일 저장 완료")
+
+    # 4. PyVista 뷰포트에서 즉시 자동 확인
+    display_in_viewport(game_mesh, output_tex_path)
+
+def display_in_viewport(mesh, texture_path):
+    """PyVista 3D 뷰포트에 자동으로 옷이 입혀진 폴리곤 표시"""
+    # Trimesh 데이터를 PyVista PolyData로 변환
+    faces_as_array = np.column_stack([
+        np.full(len(mesh.faces), 3), mesh.faces
+    ]).ravel()
+    
+    pv_mesh = pv.PolyData(mesh.vertices, faces_as_array)
+    pv_mesh.active_texture_coordinates = mesh.visual.uv
+    pv_mesh.compute_normals(inplace=True)
+
+    tex = pv.read_texture(texture_path)
+
+    plotter = pv.Plotter()
+    plotter.set_background("#18181b")
+    # PBR 셰이더로 옷감 질감 표시
+    plotter.add_mesh(
+        pv_mesh,
+        texture=tex,
+        pbr=True,
+        roughness=0.75, # 면/가죽 느낌의 거칠기
+        metallic=0.1
+    )
+    plotter.add_light(pv.Light(position=(3, 5, 5), intensity=1.0))
+    plotter.show()
+
+//==============================
+
+부위별(머리, 옷, 무기) 분할 자동 착용 방식
+스케치업에서 계층별(그룹별)로 모델링된 경우, 다음과 같이 2가지 방식으로 착용을 자동화합니다.
+
+통합 아틀라스(Atlas) 방식 (가장 간편):
+
+머리, 몸통, 바지, 무기가 1장의 UV 전개도에 패킹되어 있으므로 위 코드처럼 단 1장의 합성 텍스처만 바인딩하면 모든 부위에 맞는 옷과 피부가 제자리를 찾아 자동으로 입혀집니다.
+
+멀티 머티리얼(Multi-Material) 방식:
+
+스케치업 그룹 이름(예: Body_Armor)을 식별하여 해당 서브메시의 액터 프로퍼티에만 SetTexture("armor_diffuse.png")를 개별 할당합니다.
+
+//===============================
+
+건축 인테리어(바닥/ 벽 /천정) + 가구 /소품 등도 1차 UV mapping 이후에 AI 자동 게임용 배경 캐릭터화 하고 싶은데 가능해?
+
+//===============================
+
+, 건축 인테리어(바닥·벽·천장·가구·소품)는 캐릭터보다 형상이 규칙적(Box/Planar 위주)이기 때문에 자동화 파이프라인 구축이 훨씬 더 안정적이고 완성도 높게 작동합니다.캐릭터에서 구축했던 [그룹별 계층 인식 → 자동 UV 언랩(xatlas) → 라이트/그림자 베이킹 → AI 스타일 텍스처링(Gemini/Nano Banana) → 자동 착용] 구조를 건축 인테리어 씬에 그대로 적용하면, 스케치업으로 대충 잡은 무채색 인테리어 방을 '지브리 애니메이션 풍', '사이버펑크 RPG 풍', '손맵 캐주얼 모바일 게임 풍'의 게임용 배경 애셋으로 즉시 변환할 수 있습니다.1. 인테리어 배경의 '게임 캐릭터화(Stylized Game Asset)' 핵심 전략인테리어 배경을 게임 애셋으로 만들 때는 캐릭터와 살짝 다른 2가지 텍스처링 전략을 취할 수 있습니다.Plaintext[스케치업 인테리어 모델 로드] (바닥, 벽, 소파, 테이블, 램프 등 그룹 분리)
+                  │
+                  ▼
+[1. 부품별 UV 언랩 & 아틀라스 패킹 (xatlas)]
+   - 구조물 채널: 벽체, 바닥, 천장 (타일링 또는 대형 UV 차트)
+   - 프롭(Prop) 채널: 가구, 의자, 전등 (오브젝트 아틀라스)
+                  │
+                  ▼
+[2. 인테리어 조명 및 글로벌 일루미네이션(GI) 그림자 베이킹]
+   - 창문으로 들어오는 햇빛, 가구 밑 바닥 그림자, 구석진 곳 음영(AO)을 베이크
+                  │
+                  ▼
+[3. AI 게임 배경 스타일 텍스처 생성 (Gemini / Nano Banana)]
+   - 프롬프트: "Hand-painted stylized RPG game texture, cozy wooden room..."
+                  │
+                  ▼
+[4. 베이크 그림자 + AI 질감 자동 곱하기 합성 & 메시 바인딩]
+                  │
+                  ▼
+[5. 게임 엔진(Unreal / Unity)용 .GLB / .FBX 단일 파일로 익스포트]
+2. 인테리어 요소별 처리 구분 (구조체 vs 가구·소품)스케치업 계층 이름을 파싱하여 역할을 나누어 처리하면 게임 렌더링 품질이 극대화됩니다.구분대상 요소UV 매핑 및 텍스처링 전략건축 구조체 (Architecture)바닥(Floor), 벽(Wall), 천장(Ceiling)면적이 넓으므로 UV 타일링(Tiling) 방식을 쓰거나, 방 전체를 조감도/투시 뷰로 프로젝션하여 일괄 베이크인테리어 가구 (Furniture)소파, 식탁, 책장, 침대xatlas로 독립 언랩 후 가구 전용 텍스처 아틀라스(Atlas) 1장에 모아서 패킹소형 소품 (Props)컵, 조명등, 책, 화분저폴리곤 최적화 후 작은 스케일로 아틀라스 구석에 자동 패킹3. 인테리어 씬 전용 자동 UV 언랩 & 라이트맵 베이커 코드스케치업에서 그룹화된 인테리어 파트들을 읽어와 조명(창문 햇빛 + 실내 조명)의 그림자를 바닥과 벽, 가구 위에 자연스럽게 굽고(Bake), 게임용 텍스처 시트로 통합하는 모듈입니다.
+
+
+import numpy as np
+import trimesh
+import xatlas
+import cv2
+
+class InteriorGameAssetBaker:
+    def __init__(self, parts_dict: dict):
+        """
+        parts_dict: {
+            "Floor": trimesh_obj,
+            "Wall_Back": trimesh_obj,
+            "Sofa": trimesh_obj,
+            "Table": trimesh_obj
+        }
+        """
+        self.parts_dict = parts_dict
+        self.atlas = None
+        self.combined_mesh = None
+
+    def unwrap_room_scene(self):
+        """1단계: 인테리어 모든 요소를 겹치지 않는 1장의 게임용 UV 아틀라스로 패킹"""
+        print("⚡ 인테리어 가구 및 벽체 통합 UV 언랩 진행 중...")
+        self.atlas = xatlas.Atlas()
+
+        for name, mesh in self.parts_dict.items():
+            tri_mesh = mesh.to_triangles()
+            self.atlas.add_mesh(tri_mesh.vertices, tri_mesh.faces)
+
+        # 고속 차트 분할 및 패킹
+        self.atlas.generate()
+        print(f"✔ 언랩 완료: 총 {self.atlas.chart_count}개의 인테리어 면이 2D 아틀라스에 패킹되었습니다.")
+
+    def bake_ambient_and_sunlight(self, sun_pos=np.array([10.0, 15.0, 10.0]), img_size=2048):
+        """
+        2단계: 창문에서 들어오는 햇빛과 실내 가구 간의 차폐 그림자 베이킹
+        """
+        print("☀️ 인테리어 씬 라이트맵 베이킹 시작...")
+        
+        # 합쳐진 전체 씬 메시 생성 (광선 충돌 검사용)
+        combined_meshes = [m.to_triangles() for m in self.parts_dict.values()]
+        full_scene = trimesh.util.concatenate(combined_meshes)
+        ray_intersector = full_scene.ray
+
+        bake_canvas = np.ones((img_size, img_size), dtype=np.float32)
+
+        # 각 파트별 언랩 결과 순회
+        for mesh_output in self.atlas:
+            uvs = mesh_output.uv
+            indices = mesh_output.indices
+
+            pixel_uvs = (uvs * [img_size - 1, img_size - 1]).astype(np.int32)
+            pixel_uvs[:, 1] = (img_size - 1) - pixel_uvs[:, 1]
+
+            for face in indices:
+                pts_uv = pixel_uvs[face]
+                # 삼각형 중심 계산 및 광선 쏘기 (그림자 판정)
+                pts_3d = full_scene.vertices[face]
+                center_3d = np.mean(pts_3d, axis=0)
+                face_normal = np.cross(pts_3d[1] - pts_3d[0], pts_3d[2] - pts_3d[0])
+                norm = np.linalg.norm(face_normal)
+                if norm == 0: continue
+                face_normal /= norm
+
+                light_dir = sun_pos - center_3d
+                dist = np.linalg.norm(light_dir)
+                light_dir /= dist
+
+                dot = np.dot(face_normal, light_dir)
+                if dot <= 0:
+                    intensity = 0.3 # 실내 기본 앰비언트 음영
+                else:
+                    origin = center_3d + face_normal * 0.01
+                    hits = ray_intersector.intersects_any(
+                        ray_origins=[origin],
+                        ray_directions=[light_dir]
+                    )
+                    # 다른 가구/벽에 빛이 가려지면 어둡게 처리
+                    intensity = 0.35 if hits[0] else min(1.0, 0.4 + 0.6 * dot)
+
+                cv2.fillPoly(bake_canvas, [pts_uv], float(intensity))
+
+        # 가구 모서리가 부드럽게 보이도록 블러 처리
+        baked_lightmap = (bake_canvas * 255).astype(np.uint8)
+        baked_lightmap = cv2.GaussianBlur(baked_lightmap, (5, 5), 0)
+        cv2.imwrite("interior_lightmap.png", baked_lightmap)
+        print("✔ 인테리어 라이트맵 저장 완료: interior_lightmap.png")
+        return baked_lightmap
+
+//================================
+
+4. AI 게임풍 텍스처링 연동 (나노 바나나 / Gemini)
+베이크가 끝나면 인테리어 전개도(interior_uv_layout.png)를 기반으로 Gemini나 Nano Banana에게 다음과 같은 게임 그래픽 스타일 프롬프트를 주어 텍스처를 생성합니다:
+
+스타일 예시 프롬프트:
+
+"Stylized hand-painted texture map for interior game scene, cozy RPG tavern room, cartoonish warm oak wood floor, plaster walls with soft scratches, worn fabric couch, cozy ambient lighting, clean game asset UV map, 8k resolution, flat diffuse map with no harsh baked light"
+
+자동 착용 파이프라인 (Blend):
+
+AI가 생성한 알베도 텍스처(핸드페인팅 질감)를 받습니다.
+
+위에서 베이킹한 interior_lightmap.png(실제 3D 공간의 그림자)와 곱하기(Multiply) 결합합니다.
+
+결합된 텍스처를 스케치업 인테리어 메시에 자동 바인딩(SetTexture)하여 .glb 파일로 내보냅니다.
+
+5. 실무적 기대 효과
+실시간 게임 엔진 최적화 (Draw Call 절감):
+
+바닥, 벽, 수십 개의 가구가 각각 다른 머티리얼을 쓰지 않고 단 1장의 아틀라스 텍스처(Texture Atlas)로 통합되므로 모바일 게임이나 WebGL(메타버스 웹 뷰어)에서도 60fps로 매우 가볍게 돌아갑니다.
+
+배경과 캐릭터의 그래픽 톤 일치:
+
+스케치업으로 만든 캐릭터와 인테리어 배경을 동일한 AI 스타일 프롬프트로 텍스처링할 수 있어, 캐릭터가 방 안에 서 있을 때 그래픽 풍(예: 카툰 렌더링, 로우폴리 레트로풍)이 완벽하게 일치하는 게임 씬을 혼자서도 순식간에 제작할 수 있습니다.
+
+//=======================================
+
+태양광 라이팅 및 실내 조명 라이팅은 AI 나노바나나로 하고 싶은데 가능해?
+
+//=======================================
+
+네, 충분히 가능하며 오히려 기존 3D 툴보다 훨씬 극적이고 감성적인 연출이 가능합니다.
+
+다만 2D 생성형 AI인 나노 바나나(Nano Banana / Gemini Image)를 게임 배경 파이프라인에 도입할 때는 "3D 지오메트리 뷰포트와 AI의 역할 분담" 방식을 이해하고 연결하는 것이 핵심입니다.
+
+1. 나노 바나나로 라이팅을 처리할 때의 2가지 접근 방식
+구분	방식 A. 뷰포트 캡처 ➔ 나노 바나나 ➔ 프로젝션 (가장 추천)	방식 B. UV 전개도 ➔ 나노 바나나 Inpainting
+작동 원리	3D 모델을 카메라 뷰(투시도)에서 캡처 후, 나노 바나나가 햇살/실내 조명을 그려 넣고 이를 3D 메시에 다시 투영(Project)	2D UV 전개도 상태에서 창문 영역과 조명 영역을 마스킹하여 나노 바나나에 빛 효과 생성 요청
+장점	창문으로 쏟아지는 **빛줄기(God-ray), 바닥에 길게 늘어지는 창틀 그림자, 실내 무드등의 따뜻한 빛 번짐(Bloom)**이 완벽하게 표현됨	단 1장의 텍스처 시트로 바로 패킹 가능
+적합한 용도	감성적인 RPG/지브리풍 인테리어 씬	평면적이고 균일한 타일 텍스처
+2. 추천 워크플로우: '나노 바나나 조명 베이킹' 3단계
+Plaintext
+[1. 뷰포트 무채색 렌더 캡처] 
+   - 스케치업 모델을 PyVista 뷰포트에서 원하는 구도(카메라 각도)로 캡처
+   - 뷰포트의 3D 월드 좌표(XYZ) 및 카메라 행렬 정보 저장
+          │
+          ▼
+[2. 나노 바나나(Nano Banana) 라이팅 생성]
+   - 캡처 이미지를 AI 입력(Img2Img)으로 넣고 조명 프롬프트 전달:
+     "Golden hour dramatic sunlight pouring through window, casting window frame shadows on wooden floor, cozy warm ambient lamp lighting, anime game interior style"
+   - 나노 바나나가 사실적인 광원, 부드러운 빛 번짐, 그림자를 포함한 렌더 이미지 생성
+          │
+          ▼
+[3. 3D 메시 UV로 역투영 (Camera Projection Baking)]
+   - 나노 바나나가 그려준 2D 조명 이미지를 카메라 각도에 맞춰 3D 폴리곤의 UV 좌표에 1:1로 구워 넣음(Bake)
+          │
+          ▼
+[4. 최종 게임용 에셋 완성]
+   - 게임 엔진에서 무거운 실시간 조명을 켜지 않아도, 나노 바나나가 그린 감성 조명이 바닥/벽에 영구 고정되어 가볍게 구동됨
+3. 나노 바나나용 태양광 & 실내 조명 프롬프트 템플릿
+나노 바나나에게 프롬프트를 넘길 때 빛의 방향, 색온도, 그림자의 질감을 명시하면 게임 아트 수준의 결과물이 나옵니다.
+
+① 창문으로 쏟아지는 자연 태양광 (Sunlight / God-Rays)
+Plaintext
+(Input: Viewport Clay Capture Image)
+Prompt: 
+"A cozy stylized anime game room interior, cinematic golden hour sunlight streaming through the large window, visible volumetric light rays (god rays), soft warm sunbeam hitting the wooden floor and casting detailed window frame shadows, realistic indirect bounce light on ceiling and walls, Ghibli aesthetic, sharp details, 8k resolution"
+② 아늑한 야간 실내 인공 조명 (Indoor Warm Lamp / Cozy Night)
+Plaintext
+(Input: Viewport Clay Capture Image)
+Prompt: 
+"Night time cozy interior room, moody warm tungsten lamp lighting on the bedside table, soft glowing light bulb with gentle falloff, subtle blue moonlight bleeding slightly through curtains, warm amber shadows, rich atmospheric contrast, hand-painted video game texture style"
+4. 파이썬 파이프라인 연동 방법
+앞서 구현했던 PyQt 렌더러에 다음과 같은 버튼 흐름을 연결하면 됩니다:
+
+[구도 잡기 & 캡처]: 마우스로 방 안을 둘러보고 맘에 드는 앵글에서 버튼을 눌러 scene_capture.png 저장
+
+[나노 바나나 호출]: Gemini / 나노 바나나 API로 위 프롬프트와 캡처 이미지를 전송해 lighting_result.png 수신
+
+[UV 투영 베이크]: 카메라 프로젝션 함수를 실행해 뷰포트 시점에서 보이는 폴리곤들에 조명 텍스처를 밀어 넣고 .glb로 저장
+
+이렇게 하면 스케치업에서 복잡한 조명 시뮬레이션(V-Ray 등)을 수시간 돌릴 필요 없이, 나노 바나나를 통해 몇 초 만에 고화질 햇살과 조명이 새겨진 게임용 인테리어 배경을 완성할 수 있습니다.
+
+//===================================
+
+위의 모든 내용을 앤티그래비티에서 PyQt 기반 무료 제미나이 API Key를 사용한 나노바나나 AI 프로그램을 개발할 수 있도록 작업 계획서 작성해줘
+
+//===================================
+
+PyQt5 기반 경량 건축·캐릭터 AI 렌더링 & 베이킹 스튜디오 개발 계획서본 계획서는 블렌더(Blender)나 상용 유료 렌더러 없이, PyQt5, PyVista, OpenSKP, xatlas 및 Google AI Studio 무료 Gemini API(gemini-2.5-flash / Nano Banana)를 연동하여 독립 실행형 3D 에셋 제작 파이프라인을 구축하기 위한 엔지니어링 명세서입니다.1. 프로젝트 개요 및 핵심 목표프로젝트명: NanoStudio-3D (가칭)목적: 스케치업(.skp) 원본 파일에서 객체 계층을 인식하고, 자동 UV 언랩 및 그림자 베이킹을 거쳐 Gemini/Nano Banana 기반의 실사 렌더링 및 게임용 배경·캐릭터 텍스처를 자동 생성하는 통합 파이프라인 구축.핵심 제약 조건:외부 무거운 3D 소프트웨어(Blender 등) 의존성 완전 배제.Google AI Studio 무료 API Key 할당량 준수 및 비동기 처리(QThread).3D 카메라 궤적을 추출하여 향후 Google Flow/Veo 동영상 생성 단계와 연계.2. 시스템 아키텍처 및 기술 스택Plaintext┌────────────────────────────────────────────────────────────────────────┐
+│                          PyQt5 GUI 인터페이스                           │
+│  [1. 계층 트리]        [2. PyVista 3D 뷰포트]      [3. AI/인스펙터 패널]  │
+└───────┬──────────────────────────┬─────────────────────────┬───────────┘
+        │                          │                         │
+        ▼                          ▼                         ▼
+┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐
+│ .skp / .obj 로더 │      │  xatlas & 베이커 │      │ Google GenAI SDK │
+│ (openskp/trimesh)│ ───> │  (UV 언랩/그림자) │ ───> │ (Flash / Nano)   │
+└──────────────────┘      └──────────────────┘      └──────────────────┘
+계층사용 라이브러리상세 역할GUI & 인터랙션PyQt5, pyvistaqt메인 윈도우, 다크 테마 QSS, 계층 트리, 3D 뷰포트 위젯 임베딩3D 지오메트리trimesh, pyvista, numpy메시 전처리(삼각화, 디시메이션), 법선 계산, 레이트레이싱 광선 검사스케치업 로더openskp.skp 바이너리 직접 파싱 및 레이어/컴포넌트 분할 추출UV & 베이킹xatlas-python, opencv-pythonN-gon 메시 2D 파라미터라이징, 단일 아틀라스 패킹, 그림자/AO 맵 래스터화생성형 AI 엔진google-genaiPBR 파라미터 추출(flash), Img2Img 조명/질감 생성(nano banana/flash-image)3. UI/UX 화면 구성 명세 (Rendair 스타일 4-Tab 구조)상단 QTabWidget을 통해 단계별 작업 흐름을 선형적으로 안내합니다.Tab 1: 모델 로드 & 계층 분할 (Hierarchy & Unwrap)좌측: QTreeWidget (스케치업 부품 트리: Head, Body, Floor, Wall 등 가시성 토글).중앙: PyVista 3D 뷰포트 (오브젝트 회전/줌/팬).우측 제어: [SKP 로드], [xatlas 멀티 파트 자동 언랩], [UV 전개도 PNG 추출] 버튼.Tab 2: 머티리얼 인스펙터 & 검수 (Material Ball Inspector)중앙 1: 소형 독립 머티리얼 볼(Sphere) 뷰포트.중앙 2: PBR 파라미터 수동 제어(Roughness, Metallic, Normal Scale 슬라이더).우측: Gemini PBR 챗봇 패널 (자연어 질감 묘사 ➔ 파라미터 JSON 자동 주입).Tab 3: 카메라 & 조명 (Camera & Shadow Baker)조명 컨트롤: 태양광(Sunlight) 각도 및 실내 조명 배치 슬라이더.베이킹 엔진: [그림자/AO 라이트맵 베이크] 실행 및 결과 맵 뷰어.동선 레코더: 시작 카메라(A) / 종료 카메라(B) 등록, Veo 모션 프롬프트 생성기.Tab 4: AI 나노 바나나 렌더 & 자동 착용 (AI Render & Texture Dressing)뷰포트 캡처: 현재 시점 Clay 렌더 오프스크린 캡처.나노 바나나 프롬프트: 스타일 드롭다운(지브리 카툰, 극실사 건축, 사이버펑크 등) + Gemini 프롬프트 확장.합성 & 착용: AI 생성 텍스처와 베이크된 그림자 맵 Multiply 결합 ➔ 3D 메시에 자동 바인딩 및 .glb 내보내기.4. 단계별 세부 개발 마일스톤 (WBS)Phase 1: 스케치업 로더 및 계층 인식 파이프라인 (1~2일차)openskp를 활용한 .skp 파싱 루틴 모듈화 (SketchUpLoader 클래스).컴포넌트/그룹 단위로 분리된 메시를 딕셔너리({"Wall": Trimesh, "Glass": Trimesh})로 구조화.QTreeWidget과 3D 뷰포트 액터 간의 선택/숨김(SetVisibility) 시그널-슬롯 연결.Phase 2: xatlas 자동 UV 언랩 & 아틀라스 패킹 (3~4일차)스케치업 다각형(N-gon)을 순수 삼각형으로 정리하는 전처리 파이프라인(to_triangles()).xatlas.Atlas()를 사용하여 다중 파트를 단일 텍스처 타일(0~1 UV Space)에 겹치지 않게 일괄 패킹.2048x2048 해상도의 부위별 색상 마커 UV 레이아웃 PNG 이미지 생성 루틴 구현.Phase 3: 조명 배치 및 라이트맵/그림자 베이커 (5~6일차)trimesh.ray.ray_pyembree 또는 intersects_location을 활용한 광선 추적 엔진 구성.3D 서피스 노멀과 광원 간의 각도 및 차폐 여부를 검사하여 2D UV 캔버스에 그림자 래스터화(cv2.fillPoly).가우시안 블러를 적용한 자연스러운 부드러운 음영 맵(baked_shadow_lightmap.png) 출력.Phase 4: Gemini 2.5 Flash 및 나노 바나나 API 연동 (7~8일차)UI 멈춤 방지를 위한 QThread 기반 GenAIWorker 구현.텍스트 처리: gemini-2.5-flash JSON 모드를 통한 PBR 값 및 카메라 모션 프롬프트 생성.이미지 처리: 뷰포트 오프스크린 캡처본(screenshot)을 입력으로 나노 바나나(Gemini Image) 스타일 변환 호출.Phase 5: 텍스처 자동 착용 및 게임 포맷 익스포트 (9~10일차)AI 생성 알베도 텍스처와 베이크된 그림자 맵의 Multiply 합성 알고리즘 적용.UV 좌표가 각인된 메시에 최종 텍스처를 바인딩(SimpleMaterial).게임 엔진(Unreal Engine / Unity 3D)에서 즉시 열 수 있는 텍스처 내장형 .glb 및 .obj 저장 기능 구현.
+
+5. 핵심 모듈 인터페이스 및 데이터 흐름 명세
+
+# 시스템 핵심 데이터 플로우 인터페이스 정의
+
+class AssetPipelineInterface:
+    @staticmethod
+    def load_model(skp_path: str) -> dict[str, "trimesh.Trimesh"]:
+        """SKP 파일에서 부품별 계층 메시 추출"""
+        pass
+
+    @staticmethod
+    def unwrap_and_pack(parts: dict[str, "trimesh.Trimesh"]) -> tuple["trimesh.Trimesh", str]:
+        """xatlas로 다중 파트 언랩 및 통합 UV 전개도 PNG 생성"""
+        pass
+
+    @staticmethod
+    def bake_lighting(mesh: "trimesh.Trimesh", light_pos: list[float]) -> str:
+        """광선 추적 기반 그림자 라이트맵 PNG 베이크"""
+        pass
+
+    @staticmethod
+    def generate_ai_texture(clay_img_path: str, prompt: str, style: str) -> str:
+        """나노 바나나를 통한 스타일 텍스처 생성"""
+        pass
+
+    @staticmethod
+    def dress_and_export(mesh: "trimesh.Trimesh", texture_path: str, shadow_path: str, output_path: str):
+        """그림자 합성 후 메시에 자동 착용 및 최종 GLB 파일 출력"""
+        pass
+
+//==================================
+
+
+6. 리스크 관리 및 예외 처리
+무료 API 할당량 관리:
+
+Gemini 2.5 Flash(15 RPM / 1,500 RPD) 기준을 초과하지 않도록 요청 전 쓰로틀링(Throttling) 및 중복 호출 방지 플래그 구현.
+
+스케치업 다각형 뒤집힘(Flipped Normals):
+
+스케치업 면의 앞뒤가 뒤집힌 경우 렌더링 시 투명화되거나 그림자가 반대로 베이크될 수 있으므로, 로드 즉시 mesh.fix_normals() 자동 실행.
+
+고해상도 베이킹 연산 부하:
+
+파이썬 레이트레이싱 베이킹 시 고폴리곤 모델에서 지연이 발생할 수 있으므로, 베이킹 전용 저폴리곤 프록시 메시를 임시 생성하거나 NumPy 벡터 연산으로 연산 병렬화 유지.
+
+//===============================
+
+여기에 추가로 내가 원하는 구도에서 건축물 외관이나 실내 인테리어 구도를 렌더링하는 조잠도와 투시도도 만들고 싶은데 영역을 추가 가능해? 추가가능하면 1파트 카메라 구도 설정으로 조감도/투시도 작성, 파트2 게임 배경 캐릭터 제작 이렇게 앤티그래비티 작업 계획서 만들어줘.
+
+//===============================
+
+문적인 AI 건축 및 게임 애셋 제작 솔루션 개발을 위한 PyQt5 기반 'NanoStudio-3D' 프로젝트 작업 계획서입니다.요청하신 대로 [파트 1. 전문 건축 렌더링 (조감도/투시도)]과 [파트 2. 게임 배경 & 캐릭터 애셋 제작]을 두 개의 핵심 작업 영역으로 분리하여, 각 영역에 특화된 UV 매핑, 조명, 나노 바나나 AI 연동 파이프라인을 구축하는 명세서입니다.NanoStudio-3D: PyQt5 기반 건축·게임 AI 렌더링 & 베이킹 스튜디오 개발 계획서본 계획서는 블렌더(Blender) 등 외부 프로그램 없이, PyQt5 GUI 환경 내에서 스케치업(.skp) 파일을 직접 불러와 xatlas 자동 언랩, 레이트레이싱 그림자 베이킹, 그리고 Google AI Studio 무료 API(Gemini 2.5 Flash / Nano Banana)를 연동하여 전문 건축 조감도/투시도 및 게임 엔진용 실사 애셋을 독립적으로 제작하기 위한 엔지니어링 마일스톤입니다.1. 프로젝트 개요 및 핵심 목표프로젝트명: NanoStudio-3D (Nano Banana & Arch/Game Studio)개발 목표:외부 무거운 3D 소프트웨어 의존성 완전 배제 (독립 실행형 PyQt 앱)..skp 파일 계층 구조를 인식하여 작업 영역별 맞춤형 자동 UV 언랩(xatlas) 수행.레이트레이싱 기반 고속 그림자 베이킹 엔진 구현.[파트 1] 전문 건축 조감도/투시도: 나노 바나나를 통한 극실사 감성 라이팅 및 디테일 생성.[파트 2] 게임 애셋 제작: 애니메이션/핸드페인팅 풍 질감 생성 및 최적화된 .glb 내보내기.핵심 제약 조건: Google AI Studio 무료 API Key 할당량 준수 및 비동기 처리(QThread).2. 작업 영역별 세부 개발 계획상단 QTabWidget을 통해 두 개의 핵심 작업 영역을 선형적인 파이프라인으로 분리하여 구성합니다.[PART 1] 전문 건축 조감도 & 투시도 렌더링 스튜디오이 파트는 스케치업으로 모델링 된 건축물 외관이나 실내 공간을 사용자가 원하는 카메라 구도에서 전문 렌더링 이미지로 완성하는 데 집중합니다. xatlas 언랩은 프로젝션(Projection) 매핑이나 타일링 방식에 최적화됩니다.[Step 1.1] 카메라 구도 및 화각 설정 (Camera & Field of View)기능:마우스 인터랙션을 통한 실시간 조감도(상공 부감) 및 투시도(아이 레벨) 카메라 각도 조절.FoV 슬라이더: 건축 사진 특유의 광각(Wide-angle, 20-30mm) 및 망원 느낌 조절.데이터 플로우: 현재 PyVista 카메라의 위치(position), 주시점(focal_point), FoV 정보를 딕셔너리로 저장 및 Veo 모션 프롬프트 연동 뼈대 구축.[Step 1.2] 나노 바나나 기반 감성 라이팅 & 디테일 생성 (Nano Sunlight & Bloom)기능:태양광 및 실내등 배치: 슬라이더로 태양 각도(Golden Hour, Midday) 및 실내 조명 색온도 설정.나노 바나나 호출: 현재 구도의 뷰포트 캡처 이미지를 AI 입력(Img2Img)으로 넣고 조명 프롬프트 전달."Dramatic sunlight pouring through window, casting detailed window frame shadows on floor, cozy warm ambient lamp, volumetric light rays (god-rays), photorealistic architectural photography style"결과: 나노 바나나가 생성한 사실적인 광원, 부드러운 빛 번짐, 그림자가 포함된 고해상도 조감도/투시도 이미지 수신.[Step 1.3] 조명 프로젝션 베이킹 및 최종 렌더링 (Camera Projection & Final Output)기능:카메라 프로젝션 베이크: 나노 바나나가 그린 조명/렌더링 이미지를 현재 카메라 화각에 맞춰 3D 모델 표면(UV 좌표)에 역투영하여 영구 고정(Bake).결과: 게임 엔진 등에서 실시간 조명 없이도 나노 바나나가 연출한 감성 조명이 유지되는 .glb 파일 저장 및 고해상도 렌더링 이미지 세트 내보내기.[PART 2] 게임 배경 & 캐릭터 애셋 제작 스튜디오이 파트는 스케치업에서 그룹화된 객체(캐릭터 바디, 의상, 가구, 벽체 등)를 개별 인식하여, 최적화된 게임 엔진용 애셋(.glb)으로 변환하는 데 집중합니다. xatlas 언랩은 다중 파트 통합 아틀라스(Atlas) 방식에 최적화됩니다.[Step 2.1] 계층별 계층 인식 및 개별 UV 언랩 (Per-Part Unwrap)기능:QTreeWidget 연동: 스케치업 부품 트리(Head, Body, Floor, Wall 등)를 읽어와 가시성 토글 및 선택.1차 개별 언랩: 각 부품 메시를 독립적으로 2D UV 평면 전개도로 분할.[Step 2.2] 통합 아틀라스 패킹 (Texture Atlas Packing)기능:xatlas 통합 패킹: 게임 엔진 최적화를 위해 머리, 몸통, 무기(또는 바닥, 벽, 가구) 등의 전개도 조각들을 단 1장의 정사각형 타일(UV Space 0-1) 안에 겹치지 않게 오밀조밀 배치.부위별 색상 마커 UV Map 추출: 나노 바나나 텍스처링 가이드용으로 부위별 색상이 다른 와이어프레임 이미지 저장.[Step 2.3] 조명/그림자 베이킹 (Bake Shadow Lightmaps)기능:레이트레이싱 베이커: trimesh 기반 광선 추적 엔진을 사용하여 객체 간 차폐 그림자 및 음영(AO)을 계산.UV 베이크: 계산된 그림자/명암 값을 통합 UV 전개도 픽셀에 기록(baked_shadow_lightmap.png).[Step 2.4] AI 스타일 질감 생성 및 자동 착용 (AI Texture & Auto Dressing)기능:Gemini/나노 바나나 프롬프트: 스타일 드롭다운(지브리 카툰, 핸드페인팅 풍, 사이버펑크 등) + Gemini 프롬프트 확장."Stylized hand-painted texture map, anime RPG game, cozy warm amber wooden planks, worn texture, clean game asset UV map, no harsh baked light"합성 & 착용: AI 생성 텍스처와 베이크된 그림자 맵의 Multiply 합성 ➔ 3D 메시에 자동 바인딩.결과: 최적화된 Draw Call을 지원하는 최종 .glb 애셋 파일 내보내기.3. 개발 마일스톤 및 일정 (12일 집중 스프린트)구분개발 항목주요 내용일정Phase 1Core 파이프라인.skp 로더(openskp) 모듈화, Trimesh 전처리 루틴, PyQt5 UI 뼈대1~2일차Phase 2UV & Geometryxatlas 기반 개별/통합 언랩 및 아틀라스 패킹 모듈, UV Layout PNG 추출3~4일차Phase 3Shadow Bakertrimesh 레이트레이싱 엔진 구성, 그림자/AO 래스터화 베이커, Multiply 합성5~6일차Phase 4Camera & RenderPyVista 카메라 동선 레코더, 오프스크린 Clay 캡처, 카메라 프로젝션 베이커7~8일차Phase 5AI SDK & Tab1/2google-genai 비동기 워커(QThread) 구현, Part1/Part2 UI/API 통합9~10일차Phase 6QA & Optimization무료 API 할당량 관리, fix_normals 버그 수정, 폴리곤 최적화, 최종 패키징11~12일차4. 리스크 관리 및 핵심 고려 사항무료 API 할당량 관리: gemini-2.5-flash(15 RPM / 1,500 RPD) 기준을 준수하기 위해 요청 전 쓰로틀링 및 중복 호출 방지 플래그 구현 필수.고해상도 베이킹 연산 부하: 인테리어 전체 씬 레이트레이싱 시 지연이 발생할 수 있으므로, NumPy 벡터 연산으로 병렬화 유지 및 오프스크린 렌더링 최적화.스케치업 N-gon 처리: openskp로 읽어온 N-gon 다각형을 xatlas가 인식 가능한 순수 삼각형 메시로 강제 변환하는 파이프라인(to_triangles()) 필수.가구 리깅 (Rigging): 파트2에서 생성된 캐릭터 애셋은 정지 모델임. 향후 믹사모(Mixamo) 등의 외부 자동 리깅 웹서비스와의 연동을 위한 OBJ 저장 기능 제공.
+
+//===============================
+
+뷰포트는 2가지 뷰룰 선택할 수 있게 배치 필요해 1. 사분면 뷰(평면/우측면/좌측면/배면 구성 / 2, 조감도+투시도용 카메라 시점, 목표점 적용된 뷰
+
+//===============================
+
+뷰포트를 사분면 CAD 뷰(평면/우측/좌측/배면)와 시네마틱 단일 뷰(조감도·투시도 전용)의 2가지 모드로 전환하여 작업할 수 있도록 앤티그래비티 작업 계획서에 해당 명세를 반영했습니다.PyVistaQt의 멀티 서브플롯(shape=(2, 2))과 단일 인터랙터(shape=(1, 1))를 QStackedWidget으로 감싸 버튼 클릭 한 번으로 상호 전환하는 구조입니다.NanoStudio-3D: PyQt5 기반 건축·게임 AI 렌더링 & 베이킹 스튜디오 개발 계획서 (뷰포트 듀얼 모드 추가)본 계획서는 블렌더 등 외부 3D 툴 없이, 스케치업(.skp) 원본 파일을 직접 로드하여 [파트 1: 전문 건축 조감도/투시도]와 [파트 2: 게임 배경 & 캐릭터 애셋 제작]을 수행할 수 있도록 엔지니어링 아키텍처를 정의합니다.1. 뷰포트 듀얼 디스플레이 아키텍처 (신규 추가 규격)중앙 3D 작업 영역에 QStackedWidget을 배치하여 두 가지 작업 뷰를 즉시 토글할 수 있도록 구성합니다.모드뷰포트 구성카메라 투영(Projection)주 목적모드 1: 사분면 뷰 (Quad View)4분할 격자 (shape=(2, 2))• (0,0): Top (평면도)• (0,1): Right (우측면도)• (1,0): Left (좌측면도)• (1,1): Back (배면도)직교 투영 (Orthographic)거리 왜곡 없는 정밀 치수/위치 검수모델링 부재 정렬, 조명 위치 세팅, 바닥/벽체 계층별 배치 검수모드 2: 시네마틱 뷰 (Single View)단일 대형 뷰포트 (shape=(1, 1))원근 투영 (Perspective)초점거리/FoV 제어 지원조감도(Bird's Eye) 및 인간 눈높이 투시도(Eye-Level) 구도 설정, 나노 바나나 베이킹Plaintext[뷰포트 상단 모드 전환 툴바]
+ [ ⊞ 4분할 직교 뷰 (평면/측면/배면) ]  |  [ 🔲 시네마틱 뷰 (조감도/투시도 전용) ]
+────────────────────────────────────────────────────────────────────────────
+ [모드 1: 사분면 뷰]                          [모드 2: 시네마틱 뷰]
+ ┌─────────────┬─────────────┐              ┌───────────────────────────┐
+ │ Top (평면)  │ Right (우측)│              │ [조감도 / 투시도 렌더]     │
+ ├─────────────┼─────────────┤     <=>      │                           │
+ │ Left (좌측) │ Back (배면) │              │ • 카메라 위치 (Eye Pos)   │
+ └─────────────┴─────────────┘              │ • 목표점 (Target / Focal) │
+                                            └───────────────────────────┘
+2. 작업 영역별 세부 개발 계획[PART 1] 카메라 구도 설정 & 전문 건축 조감도/투시도 작성스케치업 외관 및 실내 모델을 사용자가 지정한 시점(Eye Position)과 주시점(Focal Point) 기반의 전문 건축 렌더로 완성하는 단계입니다.Step 1.1: 뷰포트 모드 연동 및 카메라 구도 확정사분면 뷰: 조명(태양광/실내등)과 카메라 타겟의 위치 좌표$(x, y, z)$를 평면/입면도 상에서 정확히 배치.시네마틱 뷰 전환: 카메라를 조감도 모드(상공 $45^\circ$ 부감, 망원 느낌) 또는 투시도 모드(인간 시점 $1.6\text{m}$, 광각 $24\text{mm}$)로 원클릭 전환.카메라 파라미터 수치 입력: 카메라 위치, 목표점(Look-at), FoV 슬라이더 수동 입력 패널 제공.Step 1.2: 나노 바나나 기반 감성 라이팅 & 디테일 생성시네마틱 뷰포트의 오프스크린 클레이(Clay) 캡처 이미지 추출.Gemini API(gemini-2.5-flash)를 통해 조명/카메라 메타데이터를 결합한 시네마틱 건축 프롬프트 자동 조립.Nano Banana를 호출하여 일조 각도, 창문 그림자, 빛줄기(God-rays)가 포함된 실사급 조감도/투시도 수신.Step 1.3: 카메라 프로젝션 베이크 & 에셋 저장AI가 생성한 완성 이미지를 현재 뷰포트의 카메라 투영 행렬을 통해 3D 모델 표면(UV 좌표)에 역투영(Bake).씬 설정 데이터(시작/종료 카메라 좌표 및 Veo 비디오 프롬프트)와 고해상도 렌더링 컷 일괄 내보내기.[PART 2] 게임 배경 & 캐릭터 애셋 제작 (UV 언랩 & 그림자 베이킹)스케치업의 객체/그룹 구조를 분해하여 게임 엔진(Unreal, Unity)에 최적화된 저비용 고효율 애셋(.glb)으로 변환하는 단계입니다.Step 2.1: 스케치업 계층 구조 인식 (Hierarchy Tree)openskp로 읽어온 그룹/컴포넌트(바닥, 벽체, 가구, 캐릭터 파츠 등)를 QTreeWidget에 등록 및 가시성 토글.Step 2.2: xatlas 개별 언랩 및 통합 아틀라스(Atlas) 패킹각 부품을 개별 언랩한 후 단 1장의 텍스처 공간($2048 \times 2048$, UV $0\sim 1$)에 겹치지 않게 패킹.부위 식별용 색상 와이어프레임 맵(character_atlas_uv_map.png) 출력.Step 2.3: 레이트레이싱 그림자 & AO 라이트맵 베이킹trimesh 광선 추적 엔진을 사용하여 실내 차폐 그림자 및 틈새 음영(Ambient Occlusion)을 계산.계산된 음영을 2D 텍스처 캔버스에 래스터화하여 baked_shadow_lightmap.png로 저장.Step 2.4: AI 스타일 텍스처링 & 자동 착용 (Auto-Dressing)나노 바나나를 통해 게임 아트 스타일(지브리풍, 핸드페인팅 손맵, 카툰풍 등) 질감 생성.알베도 텍스처와 그림자 맵을 곱하기(Multiply) 결합한 뒤, UV 좌표가 박힌 메시에 바인딩하여 단일 .glb 파일로 저장.
+
+3. 뷰포트 듀얼 모드 구현 핵심 코드 명세PyQt5 환경에서 4분할 직교 뷰와 조감도/투시도 시네마틱 뷰를 전환하는 엔진 프로토타입 코드입니다.
+
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QStackedWidget
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
+class DualModeViewport(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # 1. 상단 뷰포트 모드 전환 바
+        btn_bar = QHBoxLayout()
+        self.btn_quad = QPushButton("⊞ 사분면 뷰 (평면/우측/좌측/배면)")
+        self.btn_single = QPushButton("🔲 시네마틱 뷰 (조감도/투시도)")
+        btn_bar.addWidget(self.btn_quad)
+        btn_bar.addWidget(self.btn_single)
+        layout.addLayout(btn_bar)
+
+        # 2. 뷰포트 스택 위젯
+        self.stack = QStackedWidget()
+        layout.addWidget(self.stack)
+
+        # --- [모드 1: 사분면 직교 뷰] ---
+        self.quad_plotter = QtInteractor(self, shape=(2, 2), border=True) # 2x2 분할
+        self.stack.addWidget(self.quad_plotter.interactor)
+
+        # --- [모드 2: 시네마틱 단일 뷰] ---
+        self.single_plotter = QtInteractor(self, shape=(1, 1))
+        self.stack.addWidget(self.single_plotter.interactor)
+
+        # 버튼 시그널 연결
+        self.btn_quad.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.btn_single.clicked.connect(lambda: self.stack.setCurrentIndex(1))
+
+    def setup_quad_cameras(self):
+        """사분면 뷰의 각 윈도우를 직교 투영 및 정규 시점으로 고정"""
+        # (0, 0) 평면도 (Top View)
+        self.quad_plotter.subplot(0, 0) #
+        self.quad_plotter.add_text("Top View (평면)", font_size=10) #
+        self.quad_plotter.view_xy() # Z축 상공에서 조망
+        self.quad_plotter.enable_parallel_projection() # 직교 투영
+
+        # (0, 1) 우측면도 (Right View)
+        self.quad_plotter.subplot(0, 1) #
+        self.quad_plotter.add_text("Right View (우측면)", font_size=10) #
+        self.quad_plotter.view_zy()
+        self.quad_plotter.enable_parallel_projection()
+
+        # (1, 0) 좌측면도 (Left View)
+        self.quad_plotter.subplot(1, 0) #
+        self.quad_plotter.add_text("Left View (좌측면)", font_size=10) #
+        self.quad_plotter.view_vector([-1, 0, 0], viewup=[0, 0, 1])
+        self.quad_plotter.enable_parallel_projection()
+
+        # (1, 1) 배면도 (Back View)
+        self.quad_plotter.subplot(1, 1) #
+        self.quad_plotter.add_text("Back View (배면)", font_size=10) #
+        self.quad_plotter.view_xz(negative=True)
+        self.quad_plotter.enable_parallel_projection()
+
+    def set_cinematic_camera(self, mode="aerial"):
+        """시네마틱 뷰의 카메라 시점(Eye) 및 주시점(Focal Point) 설정"""
+        self.single_plotter.disable_parallel_projection() # 원근 투영
+        cam = self.single_plotter.camera
+
+        if mode == "aerial":  # 조감도 (상공 45도 부감 뷰)
+            cam.position = (25.0, 25.0, 20.0)
+            cam.focal_point = (0.0, 0.0, 2.0)
+            cam.view_up = (0.0, 0.0, 1.0)
+        elif mode == "perspective":  # 투시도 (인간 눈높이 1.6m 아이 레벨)
+            cam.position = (0.0, -15.0, 1.6)
+            cam.focal_point = (0.0, 5.0, 1.6)
+            cam.view_up = (0.0, 0.0, 1.0)
+        self.single_plotter.render()
+
+//========================================
+
+집중 개발 스프린트 일정
+
+마일스톤구분주요 구현 태스크
+
+Phase 1 Core 로더 & 듀얼 뷰포트openskp 파싱 루틴, 사분면 직교 뷰(2x2) + 단일 시네마틱 뷰 스택 위젯 완성
+
+Phase 2 Part 1 카메라 & 조감도 엔진시점/목표점 제어 패널, 조감도/투시도 프리셋, 뷰포트 고해상도 오프스크린 캡처
+
+Phase 3 Part 2 UV 언랩 & 패킹xatlas 기반 다중 파트 전개 및 2D 통합 텍스처 아틀라스 패킹 알고리즘
+
+Phase 4 레이트레이싱 베이커trimesh Ray 충돌 기반 그림자/AO 베이킹, Multiply 합성 셰이더 함수
+
+Phase 5 AI SDK & 나노 바나나 파이프라인google-genai 비동기 워커 구현, 실사 조감도 생성 및 게임 텍스처 자동 착용
+
+Phase 6 통합 검수 & 배포 패키징스케치업 N-gon 예외 처리, 카메라 프로젝션 베이크 정합성 테스트, 최종 빌드
+
+//========================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+앱 내 원클릭 SKP 지원을 원할 경우: openskp를 앱 백그라운드에 심어 사용자가 .skp 파일을 파일 열기 대화상자로 선택했을 때 자동으로 메모리 상에서 변환해 뷰포트에 띄우도록 파이프라인을 구성하면 됩니다.
