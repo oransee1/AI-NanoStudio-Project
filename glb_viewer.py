@@ -1,12 +1,17 @@
 import sys
 import vtk
 import pyvista as pv
+import os
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QTreeWidget, QTreeWidgetItem, QPushButton, QSplitter, QLabel
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap, QIcon
 from pyvistaqt import QtInteractor
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_PATH = os.path.join(BASE_DIR, "icon-1.png")
 
 # VTK OpenGL 텍스처 수 초과 및 내부 경고 메시지 콘솔 도배 억제
 vtk.vtkObject.GlobalWarningDisplayOff()
@@ -26,6 +31,9 @@ class GLBViewerApp(QMainWindow):
         self.setWindowTitle("NanoStudio GLB Viewer")
         self.resize(1100, 750)
         
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
+        
         self.actors = {}
         
         # 메인 위젯 및 분할 패널(Splitter)
@@ -42,16 +50,25 @@ class GLBViewerApp(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         
+        title_layout = QHBoxLayout()
+        if os.path.exists(ICON_PATH):
+            logo_lbl = QLabel()
+            logo_lbl.setPixmap(QPixmap(ICON_PATH).scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            title_layout.addWidget(logo_lbl)
         title_label = QLabel("<b>부품 계층 구조 (아웃라이너)</b>")
-        left_layout.addWidget(title_label)
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+        left_layout.addLayout(title_layout)
         
         btn_layout = QHBoxLayout()
-        self.btn_all_show = QPushButton("전체 표시")
-        self.btn_all_hide = QPushButton("전체 숨김")
-        self.btn_all_show.clicked.connect(lambda: self.toggle_all(True))
-        self.btn_all_hide.clicked.connect(lambda: self.toggle_all(False))
-        btn_layout.addWidget(self.btn_all_show)
-        btn_layout.addWidget(self.btn_all_hide)
+        self.btn_select_all = QPushButton("☑️ 전체 선택")
+        self.btn_deselect_all = QPushButton("☐ 전체 해제")
+        self.btn_select_all.setToolTip("아웃라이너의 모든 부품 항목을 선택(표시)합니다.")
+        self.btn_deselect_all.setToolTip("아웃라이너의 모든 부품 항목을 해제(숨김)합니다.")
+        self.btn_select_all.clicked.connect(lambda: self.toggle_all(True))
+        self.btn_deselect_all.clicked.connect(lambda: self.toggle_all(False))
+        btn_layout.addWidget(self.btn_select_all)
+        btn_layout.addWidget(self.btn_deselect_all)
         left_layout.addLayout(btn_layout)
         
         self.tree_widget = QTreeWidget()
@@ -77,12 +94,19 @@ class GLBViewerApp(QMainWindow):
 
     def toggle_all(self, visible):
         self.tree_widget.blockSignals(True)
-        for i in range(self.tree_widget.topLevelItemCount()):
-            item = self.tree_widget.topLevelItem(i)
+        
+        def _toggle_recursive(item):
             item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
             name = item.data(0, Qt.UserRole)
-            if name in self.actors:
+            if name and name in self.actors:
                 self.actors[name].SetVisibility(visible)
+            for i in range(item.childCount()):
+                _toggle_recursive(item.child(i))
+                
+        root = self.tree_widget.invisibleRootItem()
+        for i in range(root.childCount()):
+            _toggle_recursive(root.child(i))
+            
         self.tree_widget.blockSignals(False)
         self.plotter.render()
 
@@ -149,6 +173,8 @@ class GLBViewerApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    if os.path.exists(ICON_PATH):
+        app.setWindowIcon(QIcon(ICON_PATH))
     viewer = GLBViewerApp("final_game_asset_car.glb")
     viewer.show()
     sys.exit(app.exec())

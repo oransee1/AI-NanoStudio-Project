@@ -3,12 +3,20 @@ import os
 import random
 import warnings
 import vtk
+import cv2
+import numpy as np
 from dotenv import load_dotenv
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                               QHBoxLayout, QPushButton, QFileDialog, QMessageBox, QTreeWidget, QTreeWidgetItem, QLabel, QTabWidget)
+                               QHBoxLayout, QPushButton, QFileDialog, QMessageBox, 
+                               QTreeWidget, QTreeWidgetItem, QLabel, QTabWidget,
+                               QDialog, QDoubleSpinBox, QSlider, QGroupBox, 
+                               QFormLayout, QColorDialog, QLineEdit, QCheckBox, QScrollArea, QSizePolicy, QAbstractItemView,
+                               QMenu, QInputDialog, QFrame, QGridLayout)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPixmap, QIcon
+import pyvista as pv
+from pyvistaqt import QtInteractor
 
 # PyVista 및 VTK 경고 콘솔 출력 억제
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -22,21 +30,1770 @@ def _unraisable_hook(unraisable):
     sys.__unraisablehook__(unraisable)
 
 sys.unraisablehook = _unraisable_hook
-from viewport_widget import ViewportWidget
+from viewport_widget import ViewportWidget, read_hdri_texture
 from skp_loader import load_skp_to_pyvista, load_obj_to_pyvista, export_meshes_to_obj
 
 from camera_manager import CameraManager
 from uv_unwrapper import UVUnwrapper
 from shadow_baker import ShadowBaker
-from genai_worker import GenAIWorker
+from genai_worker import GenAIWorker, MaterialAIWorker
 from material_binder import MaterialBinder
+from event_logger import get_logger, log_action, install_activity_logger
 
 # .env 파일 로드
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_PATH = os.path.join(BASE_DIR, "icon-1.png")
+
 from PySide6.QtCore import Qt, QObject, QEvent, QRect, QPoint, QSize
-from PySide6.QtWidgets import QRubberBand
+from PySide6.QtWidgets import QRubberBand, QFrame, QGridLayout
+
+def cv2_imread_utf8(filepath):
+    try:
+        data = np.fromfile(filepath, dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        return img
+    except Exception as e:
+        print(f"이미지 로드 실패 ({filepath}): {e}")
+        return None
+
+def cv2_imwrite_utf8(filepath, img):
+    try:
+        ext = os.path.splitext(filepath)[1]
+        if not ext:
+            ext = ".png"
+        result, buf = cv2.imencode(ext, img)
+        if result:
+            with open(filepath, 'wb') as f:
+                f.write(buf)
+            return True
+        return False
+    except Exception as e:
+        print(f"이미지 저장 실패 ({filepath}): {e}")
+        return False
+
+def generate_pbr_maps(base_img_path, output_dir=None):
+    """
+    원본 텍스처 파일(.jpg, .tif, .png, .bmp)을 기반으로 PBR 맵 5개 자동 생성:
+    - Metallic.png
+    - Normal.png
+    - ORM.png (Occlusion=R, Roughness=G, Metallic=B)
+    - Displacement.png
+    - Roughness.png
+    """
+    if output_dir is None:
+        output_dir = os.path.dirname(base_img_path)
+    
+    img = cv2_imread_utf8(base_img_path)
+    if img is None:
+        raise ValueError("텍스처 이미지를 읽을 수 없습니다.")
+
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 1. Displacement (Height) Map
+    disp = cv2.GaussianBlur(gray, (15, 15), 0)
+    disp_norm = cv2.normalize(disp, None, 0, 255, cv2.NORM_MINMAX)
+    disp_path = os.path.join(output_dir, "Displacement.png")
+    cv2_imwrite_utf8(disp_path, disp_norm)
+
+    # 2. Normal Map (Sobel gradient depth)
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    
+    strength = 3.0
+    dx = -sobelx * strength
+    dy = -sobely * strength
+    dz = np.ones_like(gray, dtype=np.float64) * 255.0
+
+    norm_mag = np.sqrt(dx**2 + dy**2 + dz**2)
+    nx = (dx / norm_mag) * 0.5 + 0.5
+    ny = (dy / norm_mag) * 0.5 + 0.5
+    nz = (dz / norm_mag) * 0.5 + 0.5
+
+    normal_bgr = np.zeros((h, w, 3), dtype=np.uint8)
+    normal_bgr[:, :, 0] = (nz * 255).astype(np.uint8) # B = Z
+    normal_bgr[:, :, 1] = (ny * 255).astype(np.uint8) # G = Y
+    normal_bgr[:, :, 2] = (nx * 255).astype(np.uint8) # R = X
+    normal_path = os.path.join(output_dir, "Normal.png")
+    cv2_imwrite_utf8(normal_path, normal_bgr)
+
+    # 3. Roughness Map
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    lap_abs = np.uint8(np.absolute(lap))
+    roughness_gray = cv2.addWeighted(255 - gray, 0.4, lap_abs, 0.6, 0)
+    roughness_norm = cv2.normalize(roughness_gray, None, 30, 230, cv2.NORM_MINMAX)
+    roughness_path = os.path.join(output_dir, "Roughness.png")
+    cv2_imwrite_utf8(roughness_path, roughness_norm)
+
+    # 4. Metallic Map
+    _, metallic_binary = cv2.threshold(gray, 180, 255, cv2.THRESH_TOZERO)
+    metallic_norm = cv2.normalize(metallic_binary, None, 0, 255, cv2.NORM_MINMAX)
+    metallic_path = os.path.join(output_dir, "Metallic.png")
+    cv2_imwrite_utf8(metallic_path, metallic_norm)
+
+    # 5. ORM Map (R: Occlusion, G: Roughness, B: Metallic)
+    occlusion = cv2.GaussianBlur(255 - disp_norm, (31, 31), 0)
+    occlusion_norm = cv2.normalize(occlusion, None, 80, 255, cv2.NORM_MINMAX)
+    
+    orm_bgr = np.zeros((h, w, 3), dtype=np.uint8)
+    orm_bgr[:, :, 0] = metallic_norm   # B: Metallic
+    orm_bgr[:, :, 1] = roughness_norm  # G: Roughness
+    orm_bgr[:, :, 2] = occlusion_norm  # R: Occlusion
+    orm_path = os.path.join(output_dir, "ORM.png")
+    cv2_imwrite_utf8(orm_path, orm_bgr)
+
+    return {
+        "Albedo": base_img_path,
+        "Roughness": roughness_path,
+        "Metallic": metallic_path,
+        "Normal": normal_path,
+        "Displacement": disp_path,
+        "ORM": orm_path,
+    }
+
+class MaterialInspectorDialog(QDialog):
+    """독립된 구체(Sphere) 프리뷰 뷰포트 및 PBR 수치 파라미터 수동/AI 조절 패널"""
+    def __init__(self, mat_info, apply_callback=None, parent=None):
+        super().__init__(parent)
+        self.mat_info = dict(mat_info)
+        self.apply_callback = apply_callback
+        
+        self.setWindowTitle(f"🎨 PBR 머티리얼 검수 및 프리뷰 - {self.mat_info.get('name', 'Preset')}")
+        self.setFixedWidth(1080)
+        self.resize(1080, 880)
+        
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
+
+        # 대화상자 고대비 가독성 QSS 스타일시트 적용
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #F8F9FA;
+                font-family: 'Malgun Gothic', 'Segoe UI', sans-serif;
+            }
+            QGroupBox {
+                font-weight: bold;
+                font-size: 13px;
+                color: #111111;
+                border: 1px solid #B0B0B0;
+                border-radius: 6px;
+                margin-top: 6px;
+                padding-top: 6px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 6px;
+                color: #000000;
+                font-weight: bold;
+            }
+            QLabel {
+                color: #111111;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QToolTip {
+                background-color: #1E1E24;
+                color: #FFFFFF;
+                border: 1px solid #555555;
+                padding: 5px;
+                font-size: 12px;
+            }
+        """)
+            
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QHBoxLayout(self)
+        
+        # ----------------- [좌측] 독립된 구체(Sphere) 머티리얼 전용 프리뷰 뷰포트 -----------------
+        preview_box = QGroupBox("🔮 구체(Sphere) 머티리얼 프리뷰 (Material Ball)")
+        preview_layout = QVBoxLayout(preview_box)
+        
+        self.ball_plotter = QtInteractor(self)
+        self.ball_plotter.set_background("#1E1E24")
+        preview_layout.addWidget(self.ball_plotter.interactor)
+        
+        # 3점 조명 세팅 (PBR 반사 및 요철 반사광 검수용)
+        self.setup_lighting(self.ball_plotter)
+        
+        # 구체 메쉬 생성
+        self.ball_mesh = pv.Sphere(radius=1.0, theta_resolution=80, phi_resolution=80)
+        self.ball_mesh.compute_normals(inplace=True)
+        
+        color = self.mat_info.get("color", [0.8, 0.8, 0.8])
+        roughness = self.mat_info.get("roughness", 0.5)
+        metallic = self.mat_info.get("metallic", 0.0)
+        normal_scale = self.mat_info.get("normal_scale", 1.0)
+        
+        self.ball_actor = self.ball_plotter.add_mesh(
+            self.ball_mesh, color=color, pbr=True, roughness=roughness, metallic=metallic, show_edges=False
+        )
+        try:
+            prop = self.ball_actor.GetProperty()
+            if hasattr(prop, 'SetNormalScale'):
+                prop.SetNormalScale(normal_scale)
+        except Exception:
+            pass
+            
+        self.ball_plotter.reset_camera()
+        main_layout.addWidget(preview_box, stretch=1)
+        
+        # ----------------- [우측] PBR 파라미터 수치 조절 패널 (Inspector) -----------------
+        inspector_box = QWidget()
+        inspector_layout = QVBoxLayout(inspector_box)
+        inspector_layout.setContentsMargins(0, 0, 0, 0)
+        inspector_layout.setSpacing(6)
+        
+        # 1. PBR 속성 파라미터 조절 그룹
+        prop_group = QGroupBox("🎛️ PBR 속성 파라미터 검수 및 수동 조절")
+        form_layout = QFormLayout(prop_group)
+        form_layout.setSpacing(6)
+
+        # (0) 재질 이름 (Material Name) 입력/수정 필드
+        self.txt_mat_name = QLineEdit(self.mat_info.get("name", "Preset"))
+        self.txt_mat_name.setPlaceholderText("슬롯 재질 이름 입력...")
+        self.txt_mat_name.setStyleSheet("font-weight: bold; font-size: 13px; padding: 4px; border: 1px solid #B0B0B0; border-radius: 4px; color: #111111; background-color: #FFFFFF;")
+        self.txt_mat_name.textChanged.connect(self.on_name_changed)
+        form_layout.addRow("재질 이름 (Name):", self.txt_mat_name)
+
+        # (1) 알베도 컬러 (Albedo Color)
+        color_layout = QHBoxLayout()
+        self.btn_color = QPushButton()
+        self.btn_color.setFixedSize(30, 30)
+        self.update_color_button_style(color)
+        self.btn_color.clicked.connect(self.choose_color)
+        
+        self.lbl_color_hex = QLabel(self.mat_info.get("hex", self.rgb_to_hex(color)))
+        self.lbl_color_hex.setStyleSheet("font-weight: bold; font-family: monospace; font-size: 14px; color: #111111;")
+        color_layout.addWidget(self.btn_color)
+        color_layout.addWidget(self.lbl_color_hex)
+        color_layout.addStretch()
+        form_layout.addRow("알베도 컬러 (Color):", color_layout)
+        
+        # (1-2) HDRI 환경맵 (HDRI Environment Map) 항목 + 체크박스
+        self.chk_hdri = QCheckBox("HDRI 환경맵:")
+        self.chk_hdri.setChecked(self.mat_info.get("use_hdri", True))
+        self.chk_hdri.toggled.connect(self.on_toggle_hdri)
+        
+        hdri_layout = QHBoxLayout()
+        self.btn_load_hdri = QPushButton("📂 HDRI 로드")
+        self.btn_load_hdri.setToolTip("다운로드한 .hdr, .exr 또는 이미지 형식의 HDRI 환경맵을 선택합니다.")
+        self.btn_load_hdri.clicked.connect(self.choose_hdri_file)
+        
+        hdri_name = os.path.basename(self.mat_info.get("hdri_path", "")) if self.mat_info.get("hdri_path") else "기본 조명"
+        self.lbl_hdri_name = QLabel()
+        self.lbl_hdri_name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_hdri_name.setMinimumWidth(0)
+        self.lbl_hdri_name.setStyleSheet("font-size: 12px; font-weight: bold; color: #0044CC; background-color: #E8EEF9; padding: 4px 8px; border-radius: 4px; border: 1px solid #B0C4DE;")
+        self.update_hdri_label_text(hdri_name, self.mat_info.get("hdri_path", ""))
+        
+        self.btn_clear_hdri = QPushButton("❌")
+        self.btn_clear_hdri.setFixedSize(26, 26)
+        self.btn_clear_hdri.setToolTip("HDRI 환경맵 적용 해제")
+        self.btn_clear_hdri.setEnabled(bool(self.mat_info.get("hdri_path")) and self.chk_hdri.isChecked())
+        self.btn_clear_hdri.clicked.connect(self.clear_hdri_texture)
+        
+        hdri_layout.addWidget(self.btn_load_hdri)
+        hdri_layout.addWidget(self.lbl_hdri_name, stretch=1)
+        hdri_layout.addWidget(self.btn_clear_hdri)
+        form_layout.addRow(self.chk_hdri, hdri_layout)
+        
+        # (1-3) HDRI 적용 비율 (HDRI Ratio: 30% ~ 100%)
+        hdri_ratio_val = self.mat_info.get("hdri_ratio", 1.0)
+        hdri_ratio_layout = QHBoxLayout()
+        
+        self.spin_hdri_ratio = QDoubleSpinBox()
+        self.spin_hdri_ratio.setRange(30.0, 100.0)
+        self.spin_hdri_ratio.setSingleStep(5.0)
+        self.spin_hdri_ratio.setSuffix("%")
+        self.spin_hdri_ratio.setValue(hdri_ratio_val * 100.0)
+        self.spin_hdri_ratio.setEnabled(self.chk_hdri.isChecked())
+        
+        self.slider_hdri_ratio = QSlider(Qt.Horizontal)
+        self.slider_hdri_ratio.setRange(30, 100)
+        self.slider_hdri_ratio.setValue(int(hdri_ratio_val * 100.0))
+        self.slider_hdri_ratio.setEnabled(self.chk_hdri.isChecked())
+        
+        self.spin_hdri_ratio.valueChanged.connect(self.on_spin_hdri_ratio_changed)
+        self.slider_hdri_ratio.valueChanged.connect(self.on_slider_hdri_ratio_changed)
+        
+        hdri_ratio_layout.addWidget(self.spin_hdri_ratio)
+        hdri_ratio_layout.addWidget(self.slider_hdri_ratio)
+        
+        lbl_hdri_ratio_title = QLabel(" └ HDRI 적용 비율:")
+        lbl_hdri_ratio_title.setStyleSheet("color: #333333; font-size: 11px; font-weight: bold;")
+        self.lbl_hdri_ratio_title = lbl_hdri_ratio_title
+        form_layout.addRow(lbl_hdri_ratio_title, hdri_ratio_layout)
+        
+        # (2) Bright (선명도) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_bright = QCheckBox("Bright (선명도):")
+        self.chk_bright.setChecked(self.mat_info.get("use_bright", True))
+        self.chk_bright.toggled.connect(self.on_toggle_bright)
+        
+        bright_val = self.mat_info.get("bright", 1.0)
+        bright_layout = QHBoxLayout()
+        self.spin_bright = QDoubleSpinBox()
+        self.spin_bright.setRange(0.0, 10.0)
+        self.spin_bright.setSingleStep(0.1)
+        self.spin_bright.setValue(bright_val)
+        
+        self.slider_bright = QSlider(Qt.Horizontal)
+        self.slider_bright.setRange(0, 1000)
+        self.slider_bright.setValue(int(bright_val * 100))
+        
+        self.spin_bright.valueChanged.connect(self.on_spin_bright_changed)
+        self.slider_bright.valueChanged.connect(self.on_slider_bright_changed)
+        
+        bright_layout.addWidget(self.spin_bright)
+        bright_layout.addWidget(self.slider_bright)
+        form_layout.addRow(self.chk_bright, bright_layout)
+        
+        # (3) Roughness (거칠기) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_rough = QCheckBox("Roughness (거칠기):")
+        self.chk_rough.setChecked(self.mat_info.get("use_roughness", True))
+        self.chk_rough.toggled.connect(self.on_toggle_rough)
+        
+        rough_layout = QHBoxLayout()
+        self.spin_rough = QDoubleSpinBox()
+        self.spin_rough.setRange(0.0, 1.0)
+        self.spin_rough.setSingleStep(0.05)
+        self.spin_rough.setValue(roughness)
+        
+        self.slider_rough = QSlider(Qt.Horizontal)
+        self.slider_rough.setRange(0, 100)
+        self.slider_rough.setValue(int(roughness * 100))
+        
+        self.spin_rough.valueChanged.connect(self.on_spin_rough_changed)
+        self.slider_rough.valueChanged.connect(self.on_slider_rough_changed)
+        
+        rough_layout.addWidget(self.spin_rough)
+        rough_layout.addWidget(self.slider_rough)
+        form_layout.addRow(self.chk_rough, rough_layout)
+        
+        # (4) Metallic (금속성) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_metal = QCheckBox("Metallic (금속성):")
+        self.chk_metal.setChecked(self.mat_info.get("use_metallic", True))
+        self.chk_metal.toggled.connect(self.on_toggle_metal)
+        
+        metal_layout = QHBoxLayout()
+        self.spin_metal = QDoubleSpinBox()
+        self.spin_metal.setRange(0.0, 1.0)
+        self.spin_metal.setSingleStep(0.05)
+        self.spin_metal.setValue(metallic)
+        
+        self.slider_metal = QSlider(Qt.Horizontal)
+        self.slider_metal.setRange(0, 100)
+        self.slider_metal.setValue(int(metallic * 100))
+        
+        self.spin_metal.valueChanged.connect(self.on_spin_metal_changed)
+        self.slider_metal.valueChanged.connect(self.on_slider_metal_changed)
+        
+        metal_layout.addWidget(self.spin_metal)
+        metal_layout.addWidget(self.slider_metal)
+        form_layout.addRow(self.chk_metal, metal_layout)
+        
+        # (5) Normal Scale (요철 스케일) + 체크박스
+        self.chk_normal = QCheckBox("Normal Scale (요철):")
+        self.chk_normal.setChecked(self.mat_info.get("use_normal", True))
+        self.chk_normal.toggled.connect(self.on_toggle_normal)
+        
+        norm_layout = QHBoxLayout()
+        self.spin_normal = QDoubleSpinBox()
+        self.spin_normal.setRange(0.0, 3.0)
+        self.spin_normal.setSingleStep(0.1)
+        self.spin_normal.setValue(normal_scale)
+        
+        self.slider_normal = QSlider(Qt.Horizontal)
+        self.slider_normal.setRange(0, 300)
+        self.slider_normal.setValue(int(normal_scale * 100))
+        
+        self.spin_normal.valueChanged.connect(self.on_spin_normal_changed)
+        self.slider_normal.valueChanged.connect(self.on_slider_normal_changed)
+        
+        norm_layout.addWidget(self.spin_normal)
+        norm_layout.addWidget(self.slider_normal)
+        form_layout.addRow(self.chk_normal, norm_layout)
+        
+        # (6) Reflection (반사도) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_reflect = QCheckBox("Reflection (반사도):")
+        self.chk_reflect.setChecked(self.mat_info.get("use_reflection", True))
+        self.chk_reflect.toggled.connect(self.on_toggle_reflect)
+        
+        reflect_val = self.mat_info.get("reflection", 1.0)
+        reflect_layout = QHBoxLayout()
+        self.spin_reflect = QDoubleSpinBox()
+        self.spin_reflect.setRange(0.0, 10.0)
+        self.spin_reflect.setSingleStep(0.1)
+        self.spin_reflect.setValue(reflect_val)
+        
+        self.slider_reflect = QSlider(Qt.Horizontal)
+        self.slider_reflect.setRange(0, 1000)
+        self.slider_reflect.setValue(int(reflect_val * 100))
+        
+        self.spin_reflect.valueChanged.connect(self.on_spin_reflect_changed)
+        self.slider_reflect.valueChanged.connect(self.on_slider_reflect_changed)
+        
+        reflect_layout.addWidget(self.spin_reflect)
+        reflect_layout.addWidget(self.slider_reflect)
+        form_layout.addRow(self.chk_reflect, reflect_layout)
+        
+        # (7) Refraction (굴절도/IOR) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_refract = QCheckBox("Refraction (굴절도):")
+        self.chk_refract.setChecked(self.mat_info.get("use_refraction", True))
+        self.chk_refract.toggled.connect(self.on_toggle_refract)
+        
+        refract_val = self.mat_info.get("refraction", 1.50)
+        refract_layout = QHBoxLayout()
+        self.spin_refract = QDoubleSpinBox()
+        self.spin_refract.setRange(1.00, 3.00)
+        self.spin_refract.setSingleStep(0.01)
+        self.spin_refract.setDecimals(2)
+        self.spin_refract.setValue(refract_val)
+        self.spin_refract.setToolTip("굴절률(IOR): 1.0(공기), 1.33(물), 1.50(유리), 2.42(다이아몬드)")
+        
+        self.slider_refract = QSlider(Qt.Horizontal)
+        self.slider_refract.setRange(100, 300)
+        self.slider_refract.setValue(int(refract_val * 100))
+        
+        self.spin_refract.valueChanged.connect(self.on_spin_refract_changed)
+        self.slider_refract.valueChanged.connect(self.on_slider_refract_changed)
+        
+        lbl_ior_tip = QLabel("(ex. IOR 1.5=유리)")
+        lbl_ior_tip.setStyleSheet("color: #222222; font-weight: bold; font-size: 12px;")
+        self.lbl_ior_tip = lbl_ior_tip
+        
+        refract_layout.addWidget(self.spin_refract)
+        refract_layout.addWidget(self.slider_refract)
+        refract_layout.addWidget(lbl_ior_tip)
+        form_layout.addRow(self.chk_refract, refract_layout)
+        
+        # (8) Emissive (자발광) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_emissive = QCheckBox("Emissive (자발광):")
+        self.chk_emissive.setChecked(self.mat_info.get("use_emissive", False))
+        self.chk_emissive.toggled.connect(self.on_toggle_emissive)
+        
+        emissive_val = self.mat_info.get("emissive", 0.0)
+        emissive_layout = QHBoxLayout()
+        self.spin_emissive = QDoubleSpinBox()
+        self.spin_emissive.setRange(0.0, 5.0)
+        self.spin_emissive.setSingleStep(0.1)
+        self.spin_emissive.setValue(emissive_val)
+        self.spin_emissive.setToolTip("자가 발광 조명 강도 (디스플레이, 네온, 파이어, 발광 효과)")
+        
+        self.slider_emissive = QSlider(Qt.Horizontal)
+        self.slider_emissive.setRange(0, 500)
+        self.slider_emissive.setValue(int(emissive_val * 100))
+        
+        self.spin_emissive.valueChanged.connect(self.on_spin_emissive_changed)
+        self.slider_emissive.valueChanged.connect(self.on_slider_emissive_changed)
+        
+        emissive_layout.addWidget(self.spin_emissive)
+        emissive_layout.addWidget(self.slider_emissive)
+        form_layout.addRow(self.chk_emissive, emissive_layout)
+
+        # (9) Coat Strength (코팅 강도) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_coat_strength = QCheckBox("Coat Strength (코팅 강도):")
+        self.chk_coat_strength.setChecked(self.mat_info.get("use_coat_strength", False))
+        self.chk_coat_strength.toggled.connect(self.on_toggle_coat_strength)
+        
+        coat_val = self.mat_info.get("coat_strength", 0.0)
+        coat_layout = QHBoxLayout()
+        self.spin_coat_strength = QDoubleSpinBox()
+        self.spin_coat_strength.setRange(0.0, 1.0)
+        self.spin_coat_strength.setSingleStep(0.05)
+        self.spin_coat_strength.setValue(coat_val)
+        self.spin_coat_strength.setToolTip("투명 코팅층 반사 강도 (자동차 도장, 마감 니스, 에폭시/유광 마감)")
+        
+        self.slider_coat_strength = QSlider(Qt.Horizontal)
+        self.slider_coat_strength.setRange(0, 100)
+        self.slider_coat_strength.setValue(int(coat_val * 100))
+        
+        self.spin_coat_strength.valueChanged.connect(self.on_spin_coat_strength_changed)
+        self.slider_coat_strength.valueChanged.connect(self.on_slider_coat_strength_changed)
+        
+        coat_layout.addWidget(self.spin_coat_strength)
+        coat_layout.addWidget(self.slider_coat_strength)
+        form_layout.addRow(self.chk_coat_strength, coat_layout)
+
+        # (10) Coat Roughness (코팅 거칠기) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_coat_rough = QCheckBox("Coat Roughness (코팅 거칠기):")
+        self.chk_coat_rough.setChecked(self.mat_info.get("use_coat_roughness", False))
+        self.chk_coat_rough.toggled.connect(self.on_toggle_coat_rough)
+        
+        coat_rough_val = self.mat_info.get("coat_roughness", 0.0)
+        coat_rough_layout = QHBoxLayout()
+        self.spin_coat_rough = QDoubleSpinBox()
+        self.spin_coat_rough.setRange(0.0, 1.0)
+        self.spin_coat_rough.setSingleStep(0.05)
+        self.spin_coat_rough.setValue(coat_rough_val)
+        self.spin_coat_rough.setToolTip("투명 코팅층 표면 거칠기 (반광 코팅, 무광 니스, 오일 마감)")
+        
+        self.slider_coat_rough = QSlider(Qt.Horizontal)
+        self.slider_coat_rough.setRange(0, 100)
+        self.slider_coat_rough.setValue(int(coat_rough_val * 100))
+        
+        self.spin_coat_rough.valueChanged.connect(self.on_spin_coat_rough_changed)
+        self.slider_coat_rough.valueChanged.connect(self.on_slider_coat_rough_changed)
+        
+        coat_rough_layout.addWidget(self.spin_coat_rough)
+        coat_rough_layout.addWidget(self.slider_coat_rough)
+        form_layout.addRow(self.chk_coat_rough, coat_rough_layout)
+
+        # (11) Anisotropy (비등방성 반사) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_anisotropy = QCheckBox("Anisotropy (비등방성):")
+        self.chk_anisotropy.setChecked(self.mat_info.get("use_anisotropy", False))
+        self.chk_anisotropy.toggled.connect(self.on_toggle_anisotropy)
+        
+        aniso_val = self.mat_info.get("anisotropy", 0.0)
+        aniso_layout = QHBoxLayout()
+        self.spin_anisotropy = QDoubleSpinBox()
+        self.spin_anisotropy.setRange(0.0, 1.0)
+        self.spin_anisotropy.setSingleStep(0.05)
+        self.spin_anisotropy.setValue(aniso_val)
+        self.spin_anisotropy.setToolTip("방향성 결 무늬 반사 (헤어라인 메탈, 새틴 브러시, 레코드판, 탄소섬유)")
+        
+        self.slider_anisotropy = QSlider(Qt.Horizontal)
+        self.slider_anisotropy.setRange(0, 100)
+        self.slider_anisotropy.setValue(int(aniso_val * 100))
+        
+        self.spin_anisotropy.valueChanged.connect(self.on_spin_anisotropy_changed)
+        self.slider_anisotropy.valueChanged.connect(self.on_slider_anisotropy_changed)
+        
+        aniso_layout.addWidget(self.spin_anisotropy)
+        aniso_layout.addWidget(self.slider_anisotropy)
+        form_layout.addRow(self.chk_anisotropy, aniso_layout)
+
+        # (12) Occlusion (AO 음영 강도) - DoubleSpinBox & Slider 동기화 + 체크박스
+        self.chk_occlusion = QCheckBox("Occlusion (AO 음영):")
+        self.chk_occlusion.setChecked(self.mat_info.get("use_occlusion", False))
+        self.chk_occlusion.toggled.connect(self.on_toggle_occlusion)
+        
+        occ_val = self.mat_info.get("occlusion", 1.0)
+        occ_layout = QHBoxLayout()
+        self.spin_occlusion = QDoubleSpinBox()
+        self.spin_occlusion.setRange(0.0, 5.0)
+        self.spin_occlusion.setSingleStep(0.1)
+        self.spin_occlusion.setValue(occ_val)
+        self.spin_occlusion.setToolTip("구석진 틈새 주변광 차폐(Ambient Occlusion) 음영 입체감 강도")
+        
+        self.slider_occlusion = QSlider(Qt.Horizontal)
+        self.slider_occlusion.setRange(0, 500)
+        self.slider_occlusion.setValue(int(occ_val * 100))
+        
+        self.spin_occlusion.valueChanged.connect(self.on_spin_occlusion_changed)
+        self.slider_occlusion.valueChanged.connect(self.on_slider_occlusion_changed)
+        
+        occ_layout.addWidget(self.spin_occlusion)
+        occ_layout.addWidget(self.slider_occlusion)
+        form_layout.addRow(self.chk_occlusion, occ_layout)
+        
+        # (13) Occlusion(AO 음영) 항목 아래에 텍스처 불러오기 버튼 추가
+        self.btn_load_texture = QPushButton("🖼️ 텍스처 불러오기 (PBR 맵 자동 생성)")
+        self.btn_load_texture.setCursor(Qt.PointingHandCursor)
+        self.btn_load_texture.setStyleSheet("""
+            QPushButton {
+                background-color: #2E7D32;
+                color: #FFFFFF;
+                font-weight: bold;
+                font-size: 12px;
+                padding: 6px 12px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1B5E20;
+            }
+        """)
+        self.btn_load_texture.setToolTip("텍스처 파일(.jpg, .tif, .png, .bmp)을 불러오고 자동으로 Metallic.png, Normal.png, ORM.png, Displacement.png, Roughness.png 5개 파일 및 미리보기를 생성합니다.")
+        self.btn_load_texture.clicked.connect(self.choose_and_generate_pbr_textures)
+        form_layout.addRow("텍스처 수동/자동 로드:", self.btn_load_texture)
+
+        # 각각의 이미지 보기 (6개) 2by3 (2행 3열) 배치 그룹박스
+        tex_group = QGroupBox("🖼️ PBR 텍스처 맵 6종 미리보기 (2by3)")
+        grid_tex = QGridLayout(tex_group)
+        grid_tex.setSpacing(6)
+        grid_tex.setContentsMargins(6, 6, 6, 6)
+
+        self.tex_previews = {}
+
+        maps_layout_spec = [
+            ("Albedo", "Original / Albedo", 0, 0),
+            ("Roughness", "Roughness.png", 0, 1),
+            ("Metallic", "Metallic.png", 0, 2),
+            ("Normal", "Normal.png", 1, 0),
+            ("Displacement", "Displacement.png", 1, 1),
+            ("ORM", "ORM.png", 1, 2),
+        ]
+
+        for map_key, map_title, r, c in maps_layout_spec:
+            cell_w = QWidget()
+            cell_vbox = QVBoxLayout(cell_w)
+            cell_vbox.setContentsMargins(2, 2, 2, 2)
+            cell_vbox.setSpacing(2)
+            cell_vbox.setAlignment(Qt.AlignCenter)
+
+            lbl_t = QLabel(map_title)
+            lbl_t.setAlignment(Qt.AlignCenter)
+            lbl_t.setStyleSheet("font-size: 11px; font-weight: bold; color: #222222;")
+
+            lbl_img = QLabel("미로드")
+            lbl_img.setFixedSize(90, 90)
+            lbl_img.setAlignment(Qt.AlignCenter)
+            lbl_img.setScaledContents(True)
+            lbl_img.setStyleSheet("""
+                QLabel {
+                    border: 1px solid #B0B0B0;
+                    border-radius: 4px;
+                    background-color: #1E1E24;
+                    color: #AAAAAA;
+                    font-size: 10px;
+                }
+            """)
+
+            cell_vbox.addWidget(lbl_t)
+            cell_vbox.addWidget(lbl_img)
+            grid_tex.addWidget(cell_w, r, c)
+
+            self.tex_previews[map_key] = lbl_img
+
+        form_layout.addRow(tex_group)
+        
+        # PBR 스크롤 영역 설정 (수평 스크롤바 원천 차단)
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(prop_group)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        
+        inspector_layout.addWidget(scroll_area)
+        
+        # 2. AI Gemini 재질 어시스턴트 그룹
+        ai_group = QGroupBox("🤖 Gemini AI 재질 튜너")
+        ai_layout = QVBoxLayout(ai_group)
+        
+        ai_input_layout = QHBoxLayout()
+        self.txt_ai_prompt = QLineEdit()
+        self.txt_ai_prompt.setPlaceholderText("예: 비에 젖은 아스팔트, 광택 있는 세라믹...")
+        self.btn_ai_gen = QPushButton("AI 수치 파싱")
+        self.btn_ai_gen.clicked.connect(self.request_ai_material)
+        ai_input_layout.addWidget(self.txt_ai_prompt)
+        ai_input_layout.addWidget(self.btn_ai_gen)
+        ai_layout.addLayout(ai_input_layout)
+        
+        self.lbl_ai_status = QLabel("AI에 원하는 재질 느낌을 입력하면 PBR 수치가 자동 조절됩니다.")
+        self.lbl_ai_status.setStyleSheet("color: #222222; font-weight: bold; font-size: 12px; padding: 2px;")
+        ai_layout.addWidget(self.lbl_ai_status)
+        
+        inspector_layout.addWidget(ai_group)
+        
+        # 3. 하단 액션 버튼
+        btn_action_layout = QHBoxLayout()
+        self.btn_apply = QPushButton("✔ 체크된 메인 모델(부품)에 이 머티리얼 적용")
+        self.btn_apply.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 10px; border-radius: 5px;")
+        self.btn_apply.clicked.connect(self.apply_to_model)
+        
+        self.btn_close = QPushButton("닫기")
+        self.btn_close.setStyleSheet("color: #111111; font-weight: bold; padding: 10px; border-radius: 5px;")
+        self.btn_close.clicked.connect(self.reject)
+        
+        btn_action_layout.addWidget(self.btn_apply)
+        btn_action_layout.addWidget(self.btn_close)
+        
+        inspector_layout.addLayout(btn_action_layout)
+        main_layout.addWidget(inspector_box, stretch=1)
+
+        # 텍스처 미리보기 썸네일 초기화
+        self.update_texture_previews()
+
+        # 만약 전달된 mat_info에 HDRI 경로가 있다면 즉시 로드
+        if self.mat_info.get("hdri_path") and os.path.exists(self.mat_info["hdri_path"]):
+            self.load_hdri_texture(self.mat_info["hdri_path"])
+        else:
+            self.update_sphere_preview()
+
+    def choose_and_generate_pbr_textures(self):
+        """텍스처 파일(.jpg, .tif, .png, .bmp)을 불러와서 5종 PBR 맵을 자동 생성하고 미리보기에 배치"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            "텍스처 이미지 불러오기", 
+            "", 
+            "Texture Files (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*.*)"
+        )
+        if not file_path or not os.path.exists(file_path):
+            return
+
+        try:
+            out_dir = os.path.dirname(file_path)
+            maps = generate_pbr_maps(file_path, out_dir)
+            
+            # mat_info에 맵 경로 세팅
+            self.mat_info["texture_path"] = maps["Albedo"]
+            self.mat_info["roughness_map"] = maps["Roughness"]
+            self.mat_info["metallic_map"] = maps["Metallic"]
+            self.mat_info["normal_map"] = maps["Normal"]
+            self.mat_info["disp_map"] = maps["Displacement"]
+            self.mat_info["orm_map"] = maps["ORM"]
+            self.mat_info["use_texture"] = True
+            
+            # 미리보기 6개 이미지 업데이트
+            self.update_texture_previews()
+            
+            # 구체 프리뷰 업데이트
+            self.update_sphere_preview()
+            
+            QMessageBox.information(
+                self, 
+                "PBR 맵 생성 완료", 
+                f"성공적으로 5가지 PBR 맵(Roughness, Metallic, Normal, Displacement, ORM)을 생성하였습니다!\n저장 경로: {out_dir}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "PBR 맵 생성 오류", f"텍스처 처리 중 오류가 발생했습니다:\n{e}")
+
+    def update_texture_previews(self):
+        """mat_info에 지정된 PBR 텍스처 파일들을 2x3 미리보기 라벨에 표시"""
+        map_keys = {
+            "Albedo": self.mat_info.get("texture_path"),
+            "Roughness": self.mat_info.get("roughness_map"),
+            "Metallic": self.mat_info.get("metallic_map"),
+            "Normal": self.mat_info.get("normal_map"),
+            "Displacement": self.mat_info.get("disp_map"),
+            "ORM": self.mat_info.get("orm_map"),
+        }
+
+        for key, pth in map_keys.items():
+            lbl = getattr(self, 'tex_previews', {}).get(key)
+            if not lbl:
+                continue
+            if pth and os.path.exists(pth):
+                pixmap = QPixmap(pth)
+                if not pixmap.isNull():
+                    lbl.setPixmap(pixmap.scaled(90, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    lbl.setToolTip(f"{key}: {pth}")
+                else:
+                    lbl.setText("오류")
+            else:
+                lbl.setText("미로드")
+
+    def setup_lighting(self, plotter):
+        """PBR 반사광 및 HDRI 입체감 검수용 3점 조명 세팅 (메인 뷰포트와 100% 일치)"""
+        try:
+            plotter.renderer.RemoveAllLights()
+            key = pv.Light(position=(1.0, -1.0, 1.5), focal_point=(0.0, 0.0, 0.0), color='white', intensity=1.5, light_type='scenelight')
+            fill = pv.Light(position=(-1.0, -1.0, 1.0), focal_point=(0.0, 0.0, 0.0), color=(0.85, 0.9, 1.0), intensity=0.8, light_type='scenelight')
+            rim = pv.Light(position=(0.0, 1.0, -0.5), focal_point=(0.0, 0.0, 0.0), color=(1.0, 0.95, 0.85), intensity=1.0, light_type='scenelight')
+            headlight = pv.Light(light_type='headlight', color='white', intensity=0.6)
+            plotter.add_light(key)
+            plotter.add_light(fill)
+            plotter.add_light(rim)
+            plotter.add_light(headlight)
+        except Exception as e:
+            print(f"프리뷰 조명 세팅 오류: {e}")
+
+    def choose_hdri_file(self):
+        """사용자가 파일 대화상자를 통해 .hdr, .exr 등의 HDRI 파일 선택"""
+        default_dir = os.path.join(BASE_DIR, "HDRI_환경맵") if os.path.exists(os.path.join(BASE_DIR, "HDRI_환경맵")) else ""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "HDRI 환경맵 파일 선택", default_dir, "HDRI / Image Files (*.hdr *.exr *.png *.jpg);;All Files (*.*)"
+        )
+        if file_path:
+            self.load_hdri_texture(file_path)
+
+    def load_hdri_texture(self, file_path):
+        """구체 프리뷰 뷰포트에 HDRI 큐브맵 환경 및 IBL 조명을 메인 시인과 100% 동일하게 적용합니다."""
+        try:
+            cubemap = read_hdri_texture(file_path, max_dim=1024)
+            self.ball_plotter.set_environment_texture(cubemap, is_srgb=False, show_background=False)
+            if hasattr(self.ball_plotter, 'enable_image_based_lighting'):
+                try:
+                    self.ball_plotter.enable_image_based_lighting()
+                except Exception:
+                    pass
+            if hasattr(self.ball_plotter, 'renderer') and self.ball_plotter.renderer is not None:
+                try:
+                    self.ball_plotter.renderer.SetUseSphericalHarmonics(False)
+                    self.ball_plotter.renderer.SetAutomaticLightCreation(False)
+                except Exception:
+                    pass
+            self.setup_lighting(self.ball_plotter)
+            self.mat_info["hdri_path"] = file_path
+            self.update_hdri_label_text(os.path.basename(file_path), file_path)
+            self.btn_clear_hdri.setEnabled(True)
+            self.update_sphere_preview()
+            self.ball_plotter.render()
+            return True
+        except Exception as e:
+            print(f"HDRI 맵 적용 오류: {e}")
+            return False
+
+    def update_hdri_label_text(self, name, full_path=""):
+        """HDRI 파일명이 길 경우 말줄임표(...)를 사용하여 레이아웃 확장 및 수평 스크롤바 생성 방지"""
+        display_name = name
+        if len(name) > 20:
+            ext = os.path.splitext(name)[1]
+            base = os.path.splitext(name)[0]
+            display_name = base[:14] + "..." + ext
+        self.lbl_hdri_name.setText(display_name)
+        self.lbl_hdri_name.setToolTip(full_path if full_path else name)
+
+    def clear_hdri_texture(self):
+        """HDRI 환경 맵 적용 해제"""
+        try:
+            self.ball_plotter.remove_environment_texture()
+            self.mat_info["hdri_path"] = None
+            self.update_hdri_label_text("기본 조명", "")
+            self.btn_clear_hdri.setEnabled(False)
+            self.setup_lighting(self.ball_plotter)
+            self.update_sphere_preview()
+            self.ball_plotter.render()
+        except Exception:
+            pass
+
+    def rgb_to_hex(self, rgb):
+        r = int(rgb[0] * 255)
+        g = int(rgb[1] * 255)
+        b = int(rgb[2] * 255)
+        return f"#{r:02X}{g:02X}{b:02X}"
+
+    def update_color_button_style(self, color):
+        hex_code = self.rgb_to_hex(color)
+        self.btn_color.setStyleSheet(f"background-color: {hex_code}; border: 2px solid #555555; border-radius: 4px;")
+
+    def choose_color(self):
+        curr_color = self.mat_info.get("color", [0.8, 0.8, 0.8])
+        qcurr = QColor(int(curr_color[0]*255), int(curr_color[1]*255), int(curr_color[2]*255))
+        color = QColorDialog.getColor(qcurr, self, "알베도 색상 선택")
+        if color.isValid():
+            rgb = [color.redF(), color.greenF(), color.blueF()]
+            self.mat_info["color"] = rgb
+            self.mat_info["hex"] = self.rgb_to_hex(rgb)
+            self.update_color_button_style(rgb)
+            self.lbl_color_hex.setText(self.mat_info["hex"])
+            self.update_sphere_preview()
+
+    def on_spin_bright_changed(self, val):
+        self.slider_bright.blockSignals(True)
+        self.slider_bright.setValue(int(val * 100))
+        self.slider_bright.blockSignals(False)
+        self.mat_info["bright"] = val
+        self.update_sphere_preview()
+
+    def on_slider_bright_changed(self, val):
+        float_val = val / 100.0
+        self.spin_bright.blockSignals(True)
+        self.spin_bright.setValue(float_val)
+        self.spin_bright.blockSignals(False)
+        self.mat_info["bright"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_hdri_ratio_changed(self, val):
+        self.slider_hdri_ratio.blockSignals(True)
+        self.slider_hdri_ratio.setValue(int(val))
+        self.slider_hdri_ratio.blockSignals(False)
+        self.mat_info["hdri_ratio"] = val / 100.0
+        self.update_sphere_preview()
+
+    def on_slider_hdri_ratio_changed(self, val):
+        self.spin_hdri_ratio.blockSignals(True)
+        self.spin_hdri_ratio.setValue(float(val))
+        self.spin_hdri_ratio.blockSignals(False)
+        self.mat_info["hdri_ratio"] = val / 100.0
+        self.update_sphere_preview()
+
+    def on_toggle_hdri(self, checked):
+        self.btn_load_hdri.setEnabled(checked)
+        self.lbl_hdri_name.setEnabled(checked)
+        self.btn_clear_hdri.setEnabled(checked and bool(self.mat_info.get("hdri_path")))
+        if hasattr(self, 'spin_hdri_ratio'):
+            self.spin_hdri_ratio.setEnabled(checked)
+            self.slider_hdri_ratio.setEnabled(checked)
+        self.mat_info["use_hdri"] = checked
+        if not checked:
+            try:
+                self.ball_plotter.remove_environment_texture()
+            except Exception:
+                pass
+        elif self.mat_info.get("hdri_path") and os.path.exists(self.mat_info["hdri_path"]):
+            self.load_hdri_texture(self.mat_info["hdri_path"])
+        self.update_sphere_preview()
+
+    def on_toggle_bright(self, checked):
+        self.spin_bright.setEnabled(checked)
+        self.slider_bright.setEnabled(checked)
+        self.mat_info["use_bright"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_rough(self, checked):
+        self.spin_rough.setEnabled(checked)
+        self.slider_rough.setEnabled(checked)
+        self.mat_info["use_roughness"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_metal(self, checked):
+        self.spin_metal.setEnabled(checked)
+        self.slider_metal.setEnabled(checked)
+        self.mat_info["use_metallic"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_normal(self, checked):
+        self.spin_normal.setEnabled(checked)
+        self.slider_normal.setEnabled(checked)
+        self.mat_info["use_normal"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_reflect(self, checked):
+        self.spin_reflect.setEnabled(checked)
+        self.slider_reflect.setEnabled(checked)
+        self.mat_info["use_reflection"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_refract(self, checked):
+        self.spin_refract.setEnabled(checked)
+        self.slider_refract.setEnabled(checked)
+        if hasattr(self, 'lbl_ior_tip'):
+            self.lbl_ior_tip.setEnabled(checked)
+        self.mat_info["use_refraction"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_emissive(self, checked):
+        self.spin_emissive.setEnabled(checked)
+        self.slider_emissive.setEnabled(checked)
+        self.mat_info["use_emissive"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_coat_strength(self, checked):
+        self.spin_coat_strength.setEnabled(checked)
+        self.slider_coat_strength.setEnabled(checked)
+        self.mat_info["use_coat_strength"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_coat_rough(self, checked):
+        self.spin_coat_rough.setEnabled(checked)
+        self.slider_coat_rough.setEnabled(checked)
+        self.mat_info["use_coat_roughness"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_anisotropy(self, checked):
+        self.spin_anisotropy.setEnabled(checked)
+        self.slider_anisotropy.setEnabled(checked)
+        self.mat_info["use_anisotropy"] = checked
+        self.update_sphere_preview()
+
+    def on_toggle_occlusion(self, checked):
+        self.spin_occlusion.setEnabled(checked)
+        self.slider_occlusion.setEnabled(checked)
+        self.mat_info["use_occlusion"] = checked
+        self.update_sphere_preview()
+
+    def on_spin_bright_changed(self, val):
+        self.slider_bright.blockSignals(True)
+        self.slider_bright.setValue(int(val * 100))
+        self.slider_bright.blockSignals(False)
+        self.mat_info["bright"] = val
+        self.update_sphere_preview()
+
+    def on_slider_bright_changed(self, val):
+        float_val = val / 100.0
+        self.spin_bright.blockSignals(True)
+        self.spin_bright.setValue(float_val)
+        self.spin_bright.blockSignals(False)
+        self.mat_info["bright"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_rough_changed(self, val):
+        self.slider_rough.blockSignals(True)
+        self.slider_rough.setValue(int(val * 100))
+        self.slider_rough.blockSignals(False)
+        self.mat_info["roughness"] = val
+        self.update_sphere_preview()
+
+    def on_slider_rough_changed(self, val):
+        float_val = val / 100.0
+        self.spin_rough.blockSignals(True)
+        self.spin_rough.setValue(float_val)
+        self.spin_rough.blockSignals(False)
+        self.mat_info["roughness"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_metal_changed(self, val):
+        self.slider_metal.blockSignals(True)
+        self.slider_metal.setValue(int(val * 100))
+        self.slider_metal.blockSignals(False)
+        self.mat_info["metallic"] = val
+        self.update_sphere_preview()
+
+    def on_slider_metal_changed(self, val):
+        float_val = val / 100.0
+        self.spin_metal.blockSignals(True)
+        self.spin_metal.setValue(float_val)
+        self.spin_metal.blockSignals(False)
+        self.mat_info["metallic"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_normal_changed(self, val):
+        self.slider_normal.blockSignals(True)
+        self.slider_normal.setValue(int(val * 100))
+        self.slider_normal.blockSignals(False)
+        self.mat_info["normal_scale"] = val
+        self.update_sphere_preview()
+
+    def on_slider_normal_changed(self, val):
+        float_val = val / 100.0
+        self.spin_normal.blockSignals(True)
+        self.spin_normal.setValue(float_val)
+        self.spin_normal.blockSignals(False)
+        self.mat_info["normal_scale"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_reflect_changed(self, val):
+        self.slider_reflect.blockSignals(True)
+        self.slider_reflect.setValue(int(val * 100))
+        self.slider_reflect.blockSignals(False)
+        self.mat_info["reflection"] = val
+        self.update_sphere_preview()
+
+    def on_slider_reflect_changed(self, val):
+        float_val = val / 100.0
+        self.spin_reflect.blockSignals(True)
+        self.spin_reflect.setValue(float_val)
+        self.spin_reflect.blockSignals(False)
+        self.mat_info["reflection"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_refract_changed(self, val):
+        self.slider_refract.blockSignals(True)
+        self.slider_refract.setValue(int(val * 100))
+        self.slider_refract.blockSignals(False)
+        self.mat_info["refraction"] = val
+        self.update_sphere_preview()
+
+    def on_slider_refract_changed(self, val):
+        float_val = val / 100.0
+        self.spin_refract.blockSignals(True)
+        self.spin_refract.setValue(float_val)
+        self.spin_refract.blockSignals(False)
+        self.mat_info["refraction"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_emissive_changed(self, val):
+        self.slider_emissive.blockSignals(True)
+        self.slider_emissive.setValue(int(val * 100))
+        self.slider_emissive.blockSignals(False)
+        self.mat_info["emissive"] = val
+        self.update_sphere_preview()
+
+    def on_slider_emissive_changed(self, val):
+        float_val = val / 100.0
+        self.spin_emissive.blockSignals(True)
+        self.spin_emissive.setValue(float_val)
+        self.spin_emissive.blockSignals(False)
+        self.mat_info["emissive"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_coat_strength_changed(self, val):
+        self.slider_coat_strength.blockSignals(True)
+        self.slider_coat_strength.setValue(int(val * 100))
+        self.slider_coat_strength.blockSignals(False)
+        self.mat_info["coat_strength"] = val
+        self.update_sphere_preview()
+
+    def on_slider_coat_strength_changed(self, val):
+        float_val = val / 100.0
+        self.spin_coat_strength.blockSignals(True)
+        self.spin_coat_strength.setValue(float_val)
+        self.spin_coat_strength.blockSignals(False)
+        self.mat_info["coat_strength"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_coat_rough_changed(self, val):
+        self.slider_coat_rough.blockSignals(True)
+        self.slider_coat_rough.setValue(int(val * 100))
+        self.slider_coat_rough.blockSignals(False)
+        self.mat_info["coat_roughness"] = val
+        self.update_sphere_preview()
+
+    def on_slider_coat_rough_changed(self, val):
+        float_val = val / 100.0
+        self.spin_coat_rough.blockSignals(True)
+        self.spin_coat_rough.setValue(float_val)
+        self.spin_coat_rough.blockSignals(False)
+        self.mat_info["coat_roughness"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_anisotropy_changed(self, val):
+        self.slider_anisotropy.blockSignals(True)
+        self.slider_anisotropy.setValue(int(val * 100))
+        self.slider_anisotropy.blockSignals(False)
+        self.mat_info["anisotropy"] = val
+        self.update_sphere_preview()
+
+    def on_slider_anisotropy_changed(self, val):
+        float_val = val / 100.0
+        self.spin_anisotropy.blockSignals(True)
+        self.spin_anisotropy.setValue(float_val)
+        self.spin_anisotropy.blockSignals(False)
+        self.mat_info["anisotropy"] = float_val
+        self.update_sphere_preview()
+
+    def on_spin_occlusion_changed(self, val):
+        self.slider_occlusion.blockSignals(True)
+        self.slider_occlusion.setValue(int(val * 100))
+        self.slider_occlusion.blockSignals(False)
+        self.mat_info["occlusion"] = val
+        self.update_sphere_preview()
+
+    def on_slider_occlusion_changed(self, val):
+        float_val = val / 100.0
+        self.spin_occlusion.blockSignals(True)
+        self.spin_occlusion.setValue(float_val)
+        self.spin_occlusion.blockSignals(False)
+        self.mat_info["occlusion"] = float_val
+        self.update_sphere_preview()
+
+    def update_sphere_preview(self):
+        """체크박스가 켜진 PBR 항목만 구체 프리뷰에 실시간 반영하며 원색 어두워짐 보정 및 HDRI 적용 비율(30%~100%) 반영"""
+        color = self.mat_info.get("color", [0.8, 0.8, 0.8])
+        
+        use_hdri = getattr(self, 'chk_hdri', None) and self.chk_hdri.isChecked()
+        use_bright = getattr(self, 'chk_bright', None) and self.chk_bright.isChecked()
+        use_rough = getattr(self, 'chk_rough', None) and self.chk_rough.isChecked()
+        use_metal = getattr(self, 'chk_metal', None) and self.chk_metal.isChecked()
+        use_normal = getattr(self, 'chk_normal', None) and self.chk_normal.isChecked()
+        use_reflect = getattr(self, 'chk_reflect', None) and self.chk_reflect.isChecked()
+        use_refract = getattr(self, 'chk_refract', None) and self.chk_refract.isChecked()
+        use_emissive = getattr(self, 'chk_emissive', None) and self.chk_emissive.isChecked()
+        use_coat_strength = getattr(self, 'chk_coat_strength', None) and self.chk_coat_strength.isChecked()
+        use_coat_rough = getattr(self, 'chk_coat_rough', None) and self.chk_coat_rough.isChecked()
+        use_anisotropy = getattr(self, 'chk_anisotropy', None) and self.chk_anisotropy.isChecked()
+        use_occlusion = getattr(self, 'chk_occlusion', None) and self.chk_occlusion.isChecked()
+        
+        hdri_ratio = (self.spin_hdri_ratio.value() / 100.0) if hasattr(self, 'spin_hdri_ratio') else self.mat_info.get("hdri_ratio", 1.0)
+        bright = self.spin_bright.value() if use_bright else 1.0
+        rough = self.spin_rough.value() if use_rough else 0.5
+        metal = self.spin_metal.value() if use_metal else 0.0
+        normal_s = self.spin_normal.value() if use_normal else 0.0
+        reflect = self.spin_reflect.value() if use_reflect else 0.0
+        refract = self.spin_refract.value() if use_refract else 1.5
+        emissive = self.spin_emissive.value() if use_emissive else 0.0
+        coat_strength = self.spin_coat_strength.value() if use_coat_strength else 0.0
+        coat_rough = self.spin_coat_rough.value() if use_coat_rough else 0.0
+        anisotropy = self.spin_anisotropy.value() if use_anisotropy else 0.0
+        occlusion = self.spin_occlusion.value() if use_occlusion else 1.0
+        
+        # bright(선명도) 적용 색상
+        adj_color = [
+            min(1.0, max(0.0, color[0] * bright)),
+            min(1.0, max(0.0, color[1] * bright)),
+            min(1.0, max(0.0, color[2] * bright))
+        ]
+        
+        prop = getattr(self, 'ball_actor', None)
+        if prop is not None and hasattr(prop, 'GetProperty'):
+            prop = prop.GetProperty()
+        else:
+            return
+
+        if not prop:
+            return
+
+        if hasattr(prop, 'SetInterpolationToPBR'):
+            try:
+                prop.SetInterpolationToPBR()
+            except Exception:
+                pass
+        elif hasattr(prop, 'SetInterpolationToPhysicallyBased'):
+            try:
+                prop.SetInterpolationToPhysicallyBased()
+            except Exception:
+                pass
+
+        try:
+            prop.SetColor(adj_color[0], adj_color[1], adj_color[2])
+        except Exception:
+            pass
+        
+        # HDRI 적용 시 원색 색상 유지 및 HDRI 비율 반영
+        if use_hdri:
+            try:
+                if hasattr(prop, 'SetAmbient'):
+                    prop.SetAmbient(0.35 * hdri_ratio)
+                if hasattr(prop, 'SetDiffuse'):
+                    prop.SetDiffuse(0.85 + 0.15 * (1.0 - hdri_ratio))
+            except Exception:
+                pass
+        else:
+            try:
+                if hasattr(prop, 'SetAmbient'):
+                    prop.SetAmbient(0.0)
+                if hasattr(prop, 'SetDiffuse'):
+                    prop.SetDiffuse(1.0)
+            except Exception:
+                pass
+
+        if hasattr(prop, 'SetRoughness'):
+            try:
+                prop.SetRoughness(rough)
+            except Exception:
+                pass
+        if hasattr(prop, 'SetMetallic'):
+            try:
+                prop.SetMetallic(metal * hdri_ratio if use_hdri else metal)
+            except Exception:
+                pass
+        if hasattr(prop, 'SetNormalScale'):
+            try:
+                prop.SetNormalScale(normal_s)
+            except Exception:
+                pass
+        if hasattr(prop, 'SetSpecular'):
+            try:
+                prop.SetSpecular(min(1.0, reflect * hdri_ratio if use_hdri else reflect))
+            except Exception:
+                pass
+        if hasattr(prop, 'SetSpecularPower'):
+            try:
+                prop.SetSpecularPower(max(1.0, reflect * 15.0))
+            except Exception:
+                pass
+
+        # 신규 PBR 속성 (Emissive, Clearcoat, Anisotropy, Occlusion) 적용
+        if hasattr(prop, 'SetEmissiveFactor'):
+            try:
+                prop.SetEmissiveFactor(emissive, emissive, emissive)
+            except Exception:
+                pass
+        if hasattr(prop, 'SetCoatStrength'):
+            try:
+                prop.SetCoatStrength(coat_strength)
+            except Exception:
+                pass
+        if hasattr(prop, 'SetCoatRoughness'):
+            try:
+                prop.SetCoatRoughness(coat_rough)
+            except Exception:
+                pass
+        if hasattr(prop, 'SetAnisotropy'):
+            try:
+                prop.SetAnisotropy(anisotropy)
+            except Exception:
+                pass
+        if hasattr(prop, 'SetOcclusionStrength'):
+            try:
+                prop.SetOcclusionStrength(occlusion)
+            except Exception:
+                pass
+
+        # 굴절(Refraction) 항목 체크 시 투명 재질(Opacity & IOR) 표현
+        if use_refract:
+            if hasattr(prop, 'SetIOR'):
+                try:
+                    prop.SetIOR(refract)
+                except Exception:
+                    pass
+            if hasattr(prop, 'SetOpacity'):
+                try:
+                    prop.SetOpacity(0.35)
+                except Exception:
+                    pass
+        else:
+            if hasattr(prop, 'SetOpacity'):
+                try:
+                    prop.SetOpacity(1.0)
+                except Exception:
+                    pass
+
+        # 텍스처(Albedo/Normal 등)가 지정되어 있는 경우 구체 프리뷰 텍스처 입히기
+        tex_path = self.mat_info.get("texture_path")
+        if tex_path and os.path.exists(tex_path):
+            try:
+                tex = pv.read_texture(tex_path)
+                self.ball_actor.texture = tex
+            except Exception:
+                pass
+
+        try:
+            self.ball_plotter.render()
+        except Exception:
+            pass
+
+    def request_ai_material(self):
+        text = self.txt_ai_prompt.text().strip()
+        if not text:
+            return
+        self.lbl_ai_status.setText("⏳ Gemini AI가 PBR 파라미터를 분석 중입니다...")
+        self.btn_ai_gen.setEnabled(False)
+        
+        self.ai_worker = MaterialAIWorker(text, api_key=GEMINI_API_KEY)
+        self.ai_worker.finished.connect(self.on_ai_received)
+        self.ai_worker.error.connect(self.on_ai_error)
+        self.ai_worker.start()
+
+    def on_ai_received(self, data):
+        self.btn_ai_gen.setEnabled(True)
+        self.lbl_ai_status.setText(f"✅ AI 수치 수신 완료: {data.get('desc', '')}")
+        
+        if "color" in data:
+            color = data["color"]
+            self.mat_info["color"] = color
+            self.mat_info["hex"] = self.rgb_to_hex(color)
+            self.update_color_button_style(color)
+            self.lbl_color_hex.setText(self.mat_info["hex"])
+            
+        if "bright" in data or "brightness" in data:
+            b = float(data.get("bright", data.get("brightness", 1.0)))
+            self.spin_bright.setValue(b)
+            self.mat_info["bright"] = b
+
+        if "roughness" in data:
+            r = float(data["roughness"])
+            self.spin_rough.setValue(r)
+            self.mat_info["roughness"] = r
+
+        if "reflection" in data:
+            rf = float(data["reflection"])
+            self.spin_reflect.setValue(rf)
+            self.mat_info["reflection"] = rf
+
+        if "refraction" in data or "ior" in data:
+            ior = float(data.get("refraction", data.get("ior", 1.5)))
+            self.spin_refract.setValue(ior)
+            self.mat_info["refraction"] = ior
+            
+        if "metallic" in data:
+            m = float(data["metallic"])
+            self.spin_metal.setValue(m)
+            self.mat_info["metallic"] = m
+            
+        if "normal_scale" in data:
+            ns = float(data["normal_scale"])
+            self.spin_normal.setValue(ns)
+            self.mat_info["normal_scale"] = ns
+
+        if "emissive" in data:
+            e = float(data["emissive"])
+            self.spin_emissive.setValue(e)
+            self.mat_info["emissive"] = e
+
+        if "coat_strength" in data:
+            cs = float(data["coat_strength"])
+            self.spin_coat_strength.setValue(cs)
+            self.mat_info["coat_strength"] = cs
+
+        if "coat_roughness" in data:
+            cr = float(data["coat_roughness"])
+            self.spin_coat_rough.setValue(cr)
+            self.mat_info["coat_roughness"] = cr
+
+        if "anisotropy" in data:
+            an = float(data["anisotropy"])
+            self.spin_anisotropy.setValue(an)
+            self.mat_info["anisotropy"] = an
+
+        if "occlusion" in data:
+            occ = float(data["occlusion"])
+            self.spin_occlusion.setValue(occ)
+            self.mat_info["occlusion"] = occ
+            
+        self.update_sphere_preview()
+
+    def on_ai_error(self, err_msg):
+        self.btn_ai_gen.setEnabled(True)
+        self.lbl_ai_status.setText(f"❌ AI 분석 오류: {err_msg}")
+
+    def on_name_changed(self, text):
+        name = text.strip() or "Preset"
+        self.mat_info["name"] = name
+        self.setWindowTitle(f"🎨 PBR 머티리얼 검수 및 프리뷰 - {name}")
+
+    def apply_to_model(self):
+        # UI 컨트롤의 최신 수치 및 재질 이름을 mat_info에 정확히 동기화
+        if hasattr(self, 'txt_mat_name'):
+            name_val = self.txt_mat_name.text().strip()
+            self.mat_info["name"] = name_val or "Preset"
+
+        if hasattr(self, 'spin_bright'): self.mat_info["bright"] = self.spin_bright.value()
+        if hasattr(self, 'spin_rough'): self.mat_info["roughness"] = self.spin_rough.value()
+        if hasattr(self, 'spin_metal'): self.mat_info["metallic"] = self.spin_metal.value()
+        if hasattr(self, 'spin_normal'): self.mat_info["normal_scale"] = self.spin_normal.value()
+        if hasattr(self, 'spin_reflect'): self.mat_info["reflection"] = self.spin_reflect.value()
+        if hasattr(self, 'spin_refract'): self.mat_info["refraction"] = self.spin_refract.value()
+        if hasattr(self, 'spin_emissive'): self.mat_info["emissive"] = self.spin_emissive.value()
+        if hasattr(self, 'spin_coat_strength'): self.mat_info["coat_strength"] = self.spin_coat_strength.value()
+        if hasattr(self, 'spin_coat_rough'): self.mat_info["coat_roughness"] = self.spin_coat_rough.value()
+        if hasattr(self, 'spin_anisotropy'): self.mat_info["anisotropy"] = self.spin_anisotropy.value()
+        if hasattr(self, 'spin_occlusion'): self.mat_info["occlusion"] = self.spin_occlusion.value()
+
+        self.mat_info["use_hdri"] = self.chk_hdri.isChecked()
+        self.mat_info["hdri_ratio"] = self.spin_hdri_ratio.value() / 100.0 if hasattr(self, 'spin_hdri_ratio') else 1.0
+        self.mat_info["use_bright"] = self.chk_bright.isChecked()
+        self.mat_info["use_roughness"] = self.chk_rough.isChecked()
+        self.mat_info["use_metallic"] = self.chk_metal.isChecked()
+        self.mat_info["use_normal"] = self.chk_normal.isChecked()
+        self.mat_info["use_reflection"] = self.chk_reflect.isChecked()
+        self.mat_info["use_refraction"] = self.chk_refract.isChecked()
+        self.mat_info["use_emissive"] = self.chk_emissive.isChecked()
+        self.mat_info["use_coat_strength"] = self.chk_coat_strength.isChecked()
+        self.mat_info["use_coat_roughness"] = self.chk_coat_rough.isChecked()
+        self.mat_info["use_anisotropy"] = self.chk_anisotropy.isChecked()
+        self.mat_info["use_occlusion"] = self.chk_occlusion.isChecked()
+
+        # 적용할 머티리얼 정보를 저장하고 다이얼로그 정상 종료
+        self.applied_mat_info = dict(self.mat_info)
+        self.accept()
+
+    def cleanup(self):
+        """다이얼로그 종료 시 VTK QtInteractor 및 OpenGL 리소스를 언리얼 엔진 수준으로 100% 안전하게 해제"""
+        if getattr(self, '_cleaned_up', False):
+            return
+        self._cleaned_up = True
+        
+        plotter = getattr(self, 'ball_plotter', None)
+        self.ball_plotter = None
+        if plotter is not None:
+            try:
+                # 1. 렌더 타이머 정지
+                if hasattr(plotter, 'render_timer') and plotter.render_timer is not None:
+                    try:
+                        plotter.render_timer.stop()
+                    except Exception:
+                        pass
+                # 2. 렌더러에서 액터, 조명, 환경 텍스처 명시적 분리
+                if hasattr(plotter, 'renderer') and plotter.renderer is not None:
+                    try:
+                        plotter.renderer.RemoveAllViewProps()
+                        plotter.renderer.RemoveAllLights()
+                        if hasattr(plotter.renderer, 'SetEnvironmentTexture'):
+                            plotter.renderer.SetEnvironmentTexture(None)
+                    except Exception:
+                        pass
+                # 3. 플로터 메시 및 리소스 비우기
+                if hasattr(plotter, 'clear'):
+                    try:
+                        plotter.clear()
+                    except Exception:
+                        pass
+                # 4. VTK OpenGL 렌더 윈도우 Finalize (GPU 리소스 안전 언로드)
+                if hasattr(plotter, 'render_window') and plotter.render_window is not None:
+                    try:
+                        plotter.render_window.Finalize()
+                    except Exception:
+                        pass
+                # 5. 플로터 닫기
+                if hasattr(plotter, '_closed') and not plotter._closed:
+                    try:
+                        plotter.close()
+                    except Exception:
+                        pass
+                # 6. 인터랙터 위젯 부모 분리 및 소멸 예약
+                if hasattr(plotter, 'interactor') and plotter.interactor is not None:
+                    try:
+                        plotter.interactor.setParent(None)
+                        plotter.interactor.deleteLater()
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"MaterialInspectorDialog cleanup 예외: {e}")
+
+    def accept(self):
+        self.cleanup()
+        super().accept()
+
+    def reject(self):
+        self.cleanup()
+        super().reject()
+
+    def closeEvent(self, event):
+        self.cleanup()
+        super().closeEvent(event)
+
+class MaterialSlotPanel(QWidget):
+    """Cinematic View 하단 동적 원형 재질(Material) 슬롯 패널 위젯 (최대 100개 지원, 우클릭 삭제/이름변경 지원)"""
+    def __init__(self, apply_callback=None, parent=None):
+        super().__init__(parent)
+        self.apply_callback = apply_callback
+        
+        # 기본 20가지 3D 머티리얼 프리셋 정의
+        self.materials = [
+            {"name": "Red Metallic", "hex": "#E53935", "color": [0.898, 0.223, 0.208], "roughness": 0.2, "metallic": 0.9, "normal_scale": 1.0},
+            {"name": "Glossy Black", "hex": "#1E1E1E", "color": [0.117, 0.117, 0.117], "roughness": 0.05, "metallic": 0.1, "normal_scale": 1.0},
+            {"name": "Pearl White", "hex": "#F5F5F5", "color": [0.960, 0.960, 0.960], "roughness": 0.25, "metallic": 0.1, "normal_scale": 1.0},
+            {"name": "Ocean Blue", "hex": "#1E88E5", "color": [0.117, 0.533, 0.898], "roughness": 0.3, "metallic": 0.4, "normal_scale": 1.0},
+            {"name": "Racing Yellow", "hex": "#FDD835", "color": [0.992, 0.847, 0.208], "roughness": 0.15, "metallic": 0.3, "normal_scale": 1.0},
+            {"name": "Matte Gunmetal", "hex": "#424242", "color": [0.258, 0.258, 0.258], "roughness": 0.7, "metallic": 0.8, "normal_scale": 1.2},
+            {"name": "Chrome Silver", "hex": "#CFD8DC", "color": [0.811, 0.847, 0.862], "roughness": 0.05, "metallic": 1.0, "normal_scale": 1.0},
+            {"name": "Rose Gold", "hex": "#E8B4B8", "color": [0.909, 0.705, 0.721], "roughness": 0.2, "metallic": 0.85, "normal_scale": 1.0},
+            {"name": "Lime Green", "hex": "#7CB342", "color": [0.486, 0.701, 0.258], "roughness": 0.4, "metallic": 0.1, "normal_scale": 1.0},
+            {"name": "Sunset Orange", "hex": "#FB8C00", "color": [0.984, 0.549, 0.000], "roughness": 0.25, "metallic": 0.2, "normal_scale": 1.0},
+            {"name": "Tinted Cyan", "hex": "#00ACC1", "color": [0.000, 0.674, 0.756], "roughness": 0.1, "metallic": 0.5, "normal_scale": 1.0},
+            {"name": "Carbon Dark", "hex": "#263238", "color": [0.149, 0.196, 0.219], "roughness": 0.5, "metallic": 0.7, "normal_scale": 1.5},
+            {"name": "Leather Brown", "hex": "#8D6E63", "color": [0.552, 0.431, 0.388], "roughness": 0.8, "metallic": 0.0, "normal_scale": 1.8},
+            {"name": "Neon Electric", "hex": "#00E5FF", "color": [0.000, 0.898, 1.000], "roughness": 0.1, "metallic": 0.6, "normal_scale": 1.0},
+            {"name": "Royal Purple", "hex": "#8E24AA", "color": [0.556, 0.141, 0.666], "roughness": 0.3, "metallic": 0.5, "normal_scale": 1.0},
+            {"name": "Matte Satin Grey", "hex": "#78909C", "color": [0.470, 0.564, 0.611], "roughness": 0.6, "metallic": 0.2, "normal_scale": 1.0},
+            {"name": "Champagne Gold", "hex": "#D4AF37", "color": [0.831, 0.686, 0.215], "roughness": 0.15, "metallic": 0.95, "normal_scale": 1.0},
+            {"name": "Emerald Green", "hex": "#00897B", "color": [0.000, 0.537, 0.482], "roughness": 0.2, "metallic": 0.4, "normal_scale": 1.0},
+            {"name": "Ruby Magenta", "hex": "#D81B60", "color": [0.847, 0.105, 0.376], "roughness": 0.1, "metallic": 0.7, "normal_scale": 1.0},
+            {"name": "Deep Indigo", "hex": "#3F51B5", "color": [0.247, 0.317, 0.709], "roughness": 0.3, "metallic": 0.3, "normal_scale": 1.0}
+        ]
+        
+        self.init_ui()
+
+    def init_ui(self):
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMaximumHeight(85)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(2, 0, 2, 2)
+        main_layout.setSpacing(0)
+        
+        container = QFrame()
+        container.setStyleSheet("""
+            QFrame {
+                background-color: rgba(20, 20, 24, 0.92);
+                border: 1px solid #3A3A3D;
+                border-radius: 6px;
+            }
+        """)
+        
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(6, 2, 6, 2)
+        container_layout.setSpacing(1)
+        
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(4)
+        
+        if os.path.exists(ICON_PATH):
+            mat_logo_label = QLabel()
+            mat_logo_label.setPixmap(QPixmap(ICON_PATH).scaled(14, 14, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            header_layout.addWidget(mat_logo_label)
+            
+        self.lbl_title = QLabel(f"🎨 머티리얼 슬롯 ({len(self.materials)}/100)")
+        self.lbl_title.setStyleSheet("color: #E0E0E0; font-weight: bold; font-size: 11px; border: none;")
+        
+        btn_add_slot = QPushButton("➕ 슬롯 추가")
+        btn_add_slot.setCursor(Qt.PointingHandCursor)
+        btn_add_slot.setStyleSheet("""
+            QPushButton {
+                background-color: #2563EB;
+                color: #FFFFFF;
+                font-weight: bold;
+                font-size: 10px;
+                padding: 1px 5px;
+                border-radius: 3px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+        """)
+        btn_add_slot.setToolTip("최대 100개까지 신규 빈 머티리얼 슬롯을 추가합니다.")
+        btn_add_slot.clicked.connect(self.on_add_slot)
+        
+        lbl_tip = QLabel("💡 좌클릭: 수치/이름 수정 및 적용 | 우클릭: 삭제/이름 변경")
+        lbl_tip.setStyleSheet("color: #888888; font-size: 10px; border: none;")
+        
+        header_layout.addWidget(self.lbl_title)
+        header_layout.addWidget(btn_add_slot)
+        header_layout.addSpacing(6)
+        header_layout.addWidget(lbl_tip)
+        header_layout.addStretch()
+        container_layout.addLayout(header_layout)
+        
+        # 슬롯 그리드 스크롤 영역 (하단 밀착 슬림 높이 고정)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setFixedHeight(58)
+        self.scroll_area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        
+        self.grid_widget = QWidget()
+        self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setSpacing(3)
+        self.grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area.setWidget(self.grid_widget)
+        
+        container_layout.addWidget(self.scroll_area)
+        main_layout.addWidget(container)
+        
+        self.rebuild_grid_ui()
+
+    def rebuild_grid_ui(self):
+        """슬롯 추가/삭제 시 그리드 UI 전체 동적 재구성"""
+        for i in reversed(range(self.grid_layout.count())):
+            item = self.grid_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(None)
+                
+        self.slot_buttons = []
+        if hasattr(self, 'lbl_title'):
+            self.lbl_title.setText(f"🎨 머티리얼 슬롯 ({len(self.materials)}/100)")
+            
+        for idx, mat in enumerate(self.materials):
+            row = idx // 10
+            col = idx % 10
+            
+            btn = QPushButton()
+            btn.setFixedSize(26, 26)
+            btn.setCursor(Qt.PointingHandCursor)
+            name = mat.get('name', f"Slot #{idx+1}")
+            hex_col = mat.get('hex', '#888888')
+            btn.setToolTip(f"{idx+1}. {name}\n(좌클릭: PBR 수치/이름 수정 | 우클릭: 삭제/이름 변경)")
+            
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {hex_col};
+                    border: 2px solid #555555;
+                    border-radius: 13px;
+                }}
+                QPushButton:hover {{
+                    border: 2px solid #FFFFFF;
+                    background-color: {hex_col};
+                }}
+                QPushButton:pressed {{
+                    border: 2px solid #00E5FF;
+                }}
+            """)
+            
+            # 좌클릭: 머티리얼 검수/수정/적용 및 이름 저장
+            btn.clicked.connect(lambda checked=False, slot_i=idx: self.on_slot_clicked(slot_i))
+            
+            # 우클릭: 삭제 및 이름 변경 컨텍스트 메뉴
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(lambda pos, slot_i=idx: self.on_slot_context_menu(slot_i, pos))
+            
+            self.grid_layout.addWidget(btn, row, col, alignment=Qt.AlignCenter)
+            self.slot_buttons.append(btn)
+
+    def on_add_slot(self):
+        """신규 빈 머티리얼 슬롯 생성 (최대 100개까지 생성)"""
+        if len(self.materials) >= 100:
+            QMessageBox.information(self, "슬롯 한도 초과", "머티리얼 슬롯은 최대 100개까지만 생성할 수 있습니다.")
+            return
+            
+        new_idx = len(self.materials) + 1
+        new_mat = {
+            "name": f"New Material #{new_idx}",
+            "hex": "#888888",
+            "color": [0.5, 0.5, 0.5],
+            "roughness": 0.5,
+            "metallic": 0.0,
+            "normal_scale": 1.0
+        }
+        self.materials.append(new_mat)
+        self.rebuild_grid_ui()
+
+    def on_slot_context_menu(self, slot_idx, pos):
+        """슬롯 우클릭 팝업 메뉴 (슬롯 삭제 & 이름 변경)"""
+        if not (0 <= slot_idx < len(self.materials)):
+            return
+            
+        btn = self.slot_buttons[slot_idx]
+        mat = self.materials[slot_idx]
+        
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #2D2D30;
+                color: #FFFFFF;
+                border: 1px solid #555555;
+                font-size: 12px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #007ACC;
+            }
+        """)
+        
+        act_rename = menu.addAction(f"✏️ '{mat.get('name')}' 이름 변경")
+        act_delete = menu.addAction(f"🗑️ '{mat.get('name')}' 슬롯 삭제")
+        
+        action = menu.exec(btn.mapToGlobal(pos))
+        if action == act_rename:
+            new_name, ok = QInputDialog.getText(self, "재질 이름 변경", "새 머티리얼 슬롯 이름을 입력하세요:", text=mat.get('name', ''))
+            if ok and new_name.strip():
+                self.materials[slot_idx]['name'] = new_name.strip()
+                self.update_slot_ui(slot_idx)
+        elif action == act_delete:
+            if len(self.materials) <= 1:
+                QMessageBox.warning(self, "삭제 불가", "최소 1개 이상의 머티리얼 슬롯이 유지되어야 합니다.")
+                return
+            ans = QMessageBox.question(
+                self, "슬롯 삭제 확인",
+                f"정말로 '{mat.get('name')}' 머티리얼 슬롯을 삭제하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if ans == QMessageBox.Yes:
+                self.materials.pop(slot_idx)
+                self.rebuild_grid_ui()
+
+    def update_slot_ui(self, slot_idx):
+        """수정/기록된 슬롯의 원형 버튼 색상 및 툴팁 실시간 갱신"""
+        if 0 <= slot_idx < len(self.materials) and slot_idx < len(self.slot_buttons):
+            mat = self.materials[slot_idx]
+            btn = self.slot_buttons[slot_idx]
+            hex_color = mat.get('hex', '#CCCCCC')
+            name = mat.get('name', f'Slot #{slot_idx+1}')
+            btn.setToolTip(f"{slot_idx+1}. {name}\n(수정 기록됨 - 좌클릭: 수치수정/재적용 | 우클릭: 삭제/이름변경)")
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {hex_color};
+                    border: 2px solid #555555;
+                    border-radius: 13px;
+                }}
+                QPushButton:hover {{
+                    border: 2px solid #FFFFFF;
+                    background-color: {hex_color};
+                }}
+                QPushButton:pressed {{
+                    border: 2px solid #00E5FF;
+                }}
+            """)
+
+    def on_slot_clicked(self, slot_idx):
+        """머티리얼 슬롯 클릭 시 최신 수정 수치를 복원하여 인스펙터 오픈 및 적용 시 기록"""
+        if not (0 <= slot_idx < len(self.materials)):
+            return
+            
+        mat_info = self.materials[slot_idx]
+
+        if hasattr(self, '_inspector_dialog') and self._inspector_dialog is not None:
+            try:
+                self._inspector_dialog.cleanup()
+                self._inspector_dialog.close()
+            except Exception:
+                pass
+            self._inspector_dialog = None
+
+        dlg = MaterialInspectorDialog(mat_info, apply_callback=None, parent=self.window())
+        self._inspector_dialog = dlg
+        res = dlg.exec()
+        applied_info = getattr(dlg, 'applied_mat_info', None)
+        
+        # 다이얼로그 리소스 완벽 해제
+        dlg.cleanup()
+        dlg.deleteLater()
+        self._inspector_dialog = None
+
+        if res == QDialog.Accepted and applied_info:
+            # 1. 수정 및 적용한 머티리얼 파라미터 수치 및 슬롯 이름을 영구 기록(Save/Record)
+            self.materials[slot_idx].update(applied_info)
+            if 'color' in applied_info:
+                c = applied_info['color']
+                hex_val = f"#{int(c[0]*255):02X}{int(c[1]*255):02X}{int(c[2]*255):02X}"
+                self.materials[slot_idx]['hex'] = hex_val
+                
+            # 2. 하단 슬롯 원형 버튼 색상 및 툴팁 갱신
+            self.update_slot_ui(slot_idx)
+
+            # 3. 다이얼로그 소멸 후 메인 뷰포트 부품들에 최신 수치 100% 재적용
+            if self.apply_callback:
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(20, lambda info=dict(self.materials[slot_idx]): self.apply_callback(info))
 
 class RubberBandFilter(QObject):
     def __init__(self, target_widget, clear_callback=None):
@@ -77,9 +1834,23 @@ class RubberBandFilter(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI-NanoStudio - Final Integration")
+        self.base_title = "AI-NanoStudio - Final Integration"
+        self.init_ui()
+        self.update_window_title()
         self.resize(1280, 720)
+
+    def update_window_title(self, file_path=None):
+        """윈도우 타이틀바에 프로그램명과 불러오기/저장된 프로젝트 파일명 표시"""
+        if file_path:
+            file_name = os.path.basename(file_path)
+            self.setWindowTitle(f"{self.base_title} - [{file_name}]")
+        else:
+            self.setWindowTitle(self.base_title)
         
+        if os.path.exists(ICON_PATH):
+            self.setWindowIcon(QIcon(ICON_PATH))
+
+    def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
@@ -88,6 +1859,18 @@ class MainWindow(QMainWindow):
         left_panel = QWidget()
         left_panel.setFixedWidth(300)
         left_layout = QVBoxLayout(left_panel)
+        
+        # 상단 브랜드 로고 패널
+        brand_layout = QHBoxLayout()
+        if os.path.exists(ICON_PATH):
+            brand_logo = QLabel()
+            brand_logo.setPixmap(QPixmap(ICON_PATH).scaled(26, 26, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            brand_layout.addWidget(brand_logo)
+        brand_title = QLabel("AI-NanoStudio")
+        brand_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #E0E0E0;")
+        brand_layout.addWidget(brand_title)
+        brand_layout.addStretch()
+        left_layout.addLayout(brand_layout)
         
         self.btn_load_skp = QPushButton("Load .SKP File")
         self.btn_load_obj = QPushButton("Load .OBJ File (Fallback)")
@@ -98,6 +1881,10 @@ class MainWindow(QMainWindow):
         self.btn_auto_fix = QPushButton("Auto-Fix Mesh (Clean & Smooth)")
         self.btn_auto_fix.setStyleSheet("font-weight: bold; color: white; background-color: #2196F3; padding: 5px;")
         
+        self.btn_orient_normals = QPushButton("📐 모든 면 앞면 통일 (Orient Frontfaces)")
+        self.btn_orient_normals.setStyleSheet("font-weight: bold; color: white; background-color: #2E7D32; padding: 6px;")
+        self.btn_orient_normals.setToolTip("스케치업/CAD 모델에서 뒤집힌 면(Backface)을 외부 앞면(Frontface) 방향으로 100% 일괄 자동 정렬합니다.")
+        
         left_layout.addWidget(self.btn_load_skp)
         left_layout.addWidget(self.btn_load_obj)
         left_layout.addWidget(self.btn_new_project)
@@ -105,11 +1892,14 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.btn_load_anf)
         left_layout.addWidget(self.btn_export_obj)
         left_layout.addWidget(self.btn_auto_fix)
+        left_layout.addWidget(self.btn_orient_normals)
         
         # QTabWidget 추가 (높이를 내용물에 맞게 고정)
         self.tabs = QTabWidget()
         self.tabs.setFixedHeight(300)
         left_layout.addWidget(self.tabs)
+        
+        tab_icon = QIcon(ICON_PATH) if os.path.exists(ICON_PATH) else QIcon()
         
         # Tab 1: 건축/인테리어 (Part 1)
         self.tab_arch = QWidget()
@@ -120,7 +1910,10 @@ class MainWindow(QMainWindow):
         self.tab_arch_layout.addWidget(self.btn_render_arch)
         
         self.tab_arch_layout.addStretch()
-        self.tabs.addTab(self.tab_arch, "Part 1: 렌더링")
+        if not tab_icon.isNull():
+            self.tabs.addTab(self.tab_arch, tab_icon, "Part 1: 렌더링")
+        else:
+            self.tabs.addTab(self.tab_arch, "Part 1: 렌더링")
         
         # Tab 2: 게임 배경/캐릭터 제작 (Part 2)
         self.tab_game = QWidget()
@@ -136,22 +1929,45 @@ class MainWindow(QMainWindow):
         self.btn_apply_pbr = QPushButton("PBR 머터리얼 적용 (선택 부품)")
         self.tab_game_layout.addWidget(self.btn_apply_pbr)
         self.tab_game_layout.addStretch()
-        self.tabs.addTab(self.tab_game, "Part 2: 게임 에셋")
+        if not tab_icon.isNull():
+            self.tabs.addTab(self.tab_game, tab_icon, "Part 2: 게임 에셋")
+        else:
+            self.tabs.addTab(self.tab_game, "Part 2: 게임 에셋")
         
         # 아웃라이너(계층 구조) 표시 영역
+        outliner_header_layout = QHBoxLayout()
+        if os.path.exists(ICON_PATH):
+            outliner_logo = QLabel()
+            outliner_logo.setPixmap(QPixmap(ICON_PATH).scaled(16, 16, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            outliner_header_layout.addWidget(outliner_logo)
         self.outliner_label = QLabel("객체 계층 구조 (Outliner):")
-        left_layout.addWidget(self.outliner_label)
+        outliner_header_layout.addWidget(self.outliner_label)
+        outliner_header_layout.addStretch()
+        left_layout.addLayout(outliner_header_layout)
         
-        # 계층 추가/관리 버튼
+        # 계층 추가/관리 및 전체 선택/해제 버튼
         self.outliner_btn_layout = QHBoxLayout()
         self.btn_add_node = QPushButton("➕ 계층 추가")
+        self.btn_select_all = QPushButton("☑️ 전체 선택")
+        self.btn_deselect_all = QPushButton("☐ 전체 해제")
+        
+        self.btn_add_node.setToolTip("새로운 사용자 정의 계층 노드를 추가합니다.")
+        self.btn_select_all.setToolTip("아웃라이너의 모든 부품 항목을 선택(체크)합니다.")
+        self.btn_deselect_all.setToolTip("아웃라이너의 모든 부품 항목을 해제(체크해제)합니다.")
+        
         self.btn_add_node.clicked.connect(self.add_custom_node)
+        self.btn_select_all.clicked.connect(lambda: self.set_all_tree_items_check_state(True))
+        self.btn_deselect_all.clicked.connect(lambda: self.set_all_tree_items_check_state(False))
+        
         self.outliner_btn_layout.addWidget(self.btn_add_node)
-        self.outliner_btn_layout.addStretch()
+        self.outliner_btn_layout.addWidget(self.btn_select_all)
+        self.outliner_btn_layout.addWidget(self.btn_deselect_all)
         left_layout.addLayout(self.outliner_btn_layout)
 
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderLabels(["부품명"])
+        self.tree_widget.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed | QAbstractItemView.SelectedClicked)
+        self.tree_widget.itemDoubleClicked.connect(self.on_tree_item_double_clicked)
         self.tree_widget.itemChanged.connect(self.on_tree_item_changed)
         left_layout.addWidget(self.tree_widget)
         
@@ -190,6 +2006,10 @@ class MainWindow(QMainWindow):
         # ViewportWidget 내부의 single_layout 최상단에 툴바 삽입
         self.viewport.single_layout.insertLayout(0, self.cine_toolbar)
         
+        # ViewportWidget 내부의 single_layout 하단에 2by10 원형 재질 슬롯 패널 설치
+        self.mat_slot_panel = MaterialSlotPanel(apply_callback=self.on_apply_material_slot)
+        self.viewport.single_layout.addWidget(self.mat_slot_panel, stretch=0)
+        
         main_layout.addWidget(left_panel)
         main_layout.addWidget(self.viewport, stretch=1)
         
@@ -207,6 +2027,7 @@ class MainWindow(QMainWindow):
         self.btn_load_anf.clicked.connect(self.on_load_anf)
         self.btn_export_obj.clicked.connect(self.on_export_obj)
         self.btn_auto_fix.clicked.connect(self.on_btn_auto_fix)
+        self.btn_orient_normals.clicked.connect(lambda: self.orient_all_frontfaces(silent=False))
         
         self.btn_render_arch.clicked.connect(self.on_render_arch)
         self.btn_unwrap.clicked.connect(self.on_unwrap_and_bake)
@@ -231,12 +2052,16 @@ class MainWindow(QMainWindow):
         self.viewport.set_display_mode(show_edges)
         
     def load_skp_file(self, file_path):
+        log_action("LOAD_SKP_START", f"파일 경로: {file_path}")
         actors = load_skp_to_pyvista(file_path)
         if not actors:
+            log_action("LOAD_SKP_FAIL", f"로드 실패: {file_path}")
             QMessageBox.warning(self, "Load Error", "SKP 파일을 로드하지 못했습니다. openskp 설치 상태를 확인하세요.")
             return
+        log_action("LOAD_SKP_SUCCESS", f"로드 완료 | 총 {len(actors)}개 부품 감지: {list(actors.keys())[:5]}...")
         self.loaded_actors = actors
         self.populate_scene(actors)
+        self.update_window_title(file_path)
         
     def on_load_skp(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open SketchUp File", "", "SketchUp Files (*.skp)")
@@ -246,12 +2071,16 @@ class MainWindow(QMainWindow):
     def on_load_obj(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open OBJ File", "", "OBJ Files (*.obj)")
         if file_path:
+            log_action("LOAD_OBJ_START", f"파일 경로: {file_path}")
             actors = load_obj_to_pyvista(file_path)
             if not actors:
+                log_action("LOAD_OBJ_FAIL", f"로드 실패: {file_path}")
                 QMessageBox.warning(self, "Load Error", "OBJ 파일을 로드하지 못했습니다.")
                 return
+            log_action("LOAD_OBJ_SUCCESS", f"로드 완료 | 총 {len(actors)}개 부품")
             self.loaded_actors = actors
             self.populate_scene(actors)
+            self.update_window_title(file_path)
             
     def update_dimensions_text(self):
         """현재 씬에 로드된 메시들을 기반으로 전체 크기를 계산하여 뷰포트 텍스트를 업데이트합니다."""
@@ -296,7 +2125,19 @@ class MainWindow(QMainWindow):
         self.viewport.clear_and_setup()
             
         self.part_colors = {}
+        self.part_materials = {}
+        self.last_applied_material = None
+        self.frontface_locked_parts = set()
         self.part_meshes = actors_dict
+        
+        # 스케치업/CAD 모델 로드 시 매끄러운 모서리 법선(Normal) 정렬 및 외부 앞면 통일
+        for name, mesh in list(self.part_meshes.items()):
+            if mesh and getattr(mesh, 'n_cells', 0) > 0:
+                try:
+                    oriented = self.ensure_frontfaces_oriented(mesh)
+                    self.part_meshes[name] = oriented
+                except Exception:
+                    pass
         
         # 전체 바운딩 박스 크기 계산 (치수 정보 표시용)
         overall_bounds = [float('inf'), float('-inf'), float('inf'), float('-inf'), float('inf'), float('-inf')]
@@ -313,7 +2154,9 @@ class MainWindow(QMainWindow):
             
             # 아웃라이너(트리)에 항목 추가
             item = QTreeWidgetItem(self.tree_widget, [name])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
             item.setCheckState(0, Qt.Checked)
+            item.setData(0, Qt.UserRole, name)
             
             # 각 부품별로 구분되는 색상 부여
             part_color = random_color()
@@ -328,9 +2171,6 @@ class MainWindow(QMainWindow):
             self.viewport.add_mesh_to_all(mesh, name=name, color=part_color)
 
         self.update_dimensions_text()
-            
-        # 이벤트 리스너 연결
-        self.tree_widget.itemChanged.connect(self.on_tree_item_changed)
             
         # UI 업데이트
         self.btn_ai_texture.setEnabled(True)
@@ -461,6 +2301,8 @@ class MainWindow(QMainWindow):
             return None
             
         new_merged = _get_merged(picked_mesh)
+        # 계층구조상 체크된 오브젝트에 속하는 셀만 일차 필터링
+        new_merged = self.filter_mesh_by_checked_objects(new_merged)
         
         if is_ctrl_pressed and getattr(self, 'picked_mesh', None) is not None:
             old_merged = _get_merged(self.picked_mesh)
@@ -511,25 +2353,9 @@ class MainWindow(QMainWindow):
         else:
             final_mesh = new_merged
             
-        self.picked_mesh = final_mesh
-        
-        # 이전 하이라이트 지우기
-        try:
-            self.viewport.plotter_single.remove_actor("my_picked_cells")
-        except Exception:
-            pass
-            
-        # PyVista의 자체 하이라이트가 Qt 환경에서 누락될 수 있으므로, 명시적으로 핑크색 액터를 덧그립니다.
-        if final_mesh is not None and final_mesh.n_cells > 0:
-            self.viewport.plotter_single.add_mesh(
-                final_mesh, 
-                name="my_picked_cells", 
-                color="magenta", 
-                show_edges=True, 
-                line_width=3, 
-                pickable=False,
-                reset_camera=False
-            )
+        # 최종 구성된 피킹 영역을 체크 표시된 계층 오브젝트로 한 번 더 엄격히 필터링
+        self.picked_mesh = self.filter_mesh_by_checked_objects(final_mesh)
+        self.update_picked_highlight()
     def on_btn_assign(self):
         """선택된 폴리곤들을 현재 아웃라이너에서 선택된 계층으로 이동 및 색상 변경"""
         import numpy as np
@@ -616,6 +2442,11 @@ class MainWindow(QMainWindow):
                 updated_source = source_mesh.extract_cells(keep_cells)
                 if not isinstance(updated_source, pv.PolyData):
                     updated_source = updated_source.extract_surface(algorithm='dataset_surface')
+                if updated_source.n_cells > 0:
+                    try:
+                        updated_source = self.ensure_frontfaces_oriented(updated_source)
+                    except Exception:
+                        pass
             else:
                 updated_source = pv.PolyData()
                 
@@ -635,8 +2466,17 @@ class MainWindow(QMainWindow):
             if not isinstance(merged_target, pv.PolyData):
                 merged_target = merged_target.extract_surface(algorithm='dataset_surface')
                 
+            if merged_target.n_cells > 0:
+                try:
+                    merged_target = self.ensure_frontfaces_oriented(merged_target)
+                except Exception:
+                    pass
+
             self.part_meshes[target_name] = merged_target
             self.viewport.update_mesh(target_name, merged_target, self.part_colors[target_name])
+            
+            # 모든 뷰포트 플로터에 대해 가시성 동기화
+            self.sync_outliner_visibility()
             
             # 메시지 창을 띄우기 '전'에 모든 피킹 상태와 하이라이트 레이어를 완벽하게 초기화
             self.on_btn_clear_pick()
@@ -663,6 +2503,7 @@ class MainWindow(QMainWindow):
             item.setText(0, text)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
             item.setCheckState(0, Qt.Checked)
+            item.setData(0, Qt.UserRole, text)
             
             # 새 계층에 랜덤 색상 부여
             color = [random.uniform(0.3, 0.9), random.uniform(0.3, 0.9), random.uniform(0.3, 0.9)]
@@ -674,16 +2515,241 @@ class MainWindow(QMainWindow):
             pixmap.fill(QColor(int(color[0]*255), int(color[1]*255), int(color[2]*255)))
             item.setIcon(0, QIcon(pixmap))
 
+    def on_tree_item_double_clicked(self, item, column):
+        """아웃라이너 부품 항목 더블 클릭 시 인라인 명칭 편집(Rename) 모드 실행"""
+        if item is not None:
+            # 원본 명칭이 UserRole에 기록되어 있지 않은 경우 현재 텍스트로 보장 저장
+            if not item.data(0, Qt.UserRole):
+                item.setData(0, Qt.UserRole, item.text(0))
+            self.tree_widget.editItem(item, column)
+
     def on_tree_item_changed(self, item, column):
-        name = item.text(0)
-        is_checked = (item.checkState(0) == Qt.Checked)
+        old_name = item.data(0, Qt.UserRole)
+        new_name = item.text(0)
         
-        # 뷰포트의 모든 플로터에서 해당 액터의 가시성 토글
+        # 1. UserRole 데이터가 비어있었던 경우 (초기 생성 직후 등) fallback 탐색
+        if not old_name:
+            if hasattr(self, 'part_meshes') and new_name not in self.part_meshes:
+                existing_tree_names = self.get_all_tree_item_names()
+                for key in list(self.part_meshes.keys()):
+                    if key not in existing_tree_names or key == old_name:
+                        old_name = key
+                        break
+            if not old_name:
+                old_name = new_name
+            item.setData(0, Qt.UserRole, old_name)
+        
+        # 2. 아웃라이너 명칭 수정(Rename) 시 part_meshes, part_colors, plotter.actors 키 동기화
+        if old_name and old_name != new_name:
+            if hasattr(self, 'part_meshes') and old_name in self.part_meshes:
+                self.part_meshes[new_name] = self.part_meshes.pop(old_name)
+            if hasattr(self, 'part_colors') and old_name in self.part_colors:
+                self.part_colors[new_name] = self.part_colors.pop(old_name)
+            if hasattr(self, 'part_materials') and old_name in self.part_materials:
+                self.part_materials[new_name] = self.part_materials.pop(old_name)
+            
+            for plotter in self.viewport.plotters:
+                if old_name in plotter.actors:
+                    actor = plotter.actors.pop(old_name)
+                    plotter.actors[new_name] = actor
+            
+            item.setData(0, Qt.UserRole, new_name)
+
+        # 3. 계층 체크박스 상태 변경 시 자식 항목들에 상태 동기화 (부모 체크/체크해제 시 하위 전체 적용)
+        self.tree_widget.blockSignals(True)
+        try:
+            state = item.checkState(0)
+            def _propagate_check(parent_item, target_state):
+                for i in range(parent_item.childCount()):
+                    child = parent_item.child(i)
+                    child.setCheckState(0, target_state)
+                    _propagate_check(child, target_state)
+            _propagate_check(item, state)
+        finally:
+            self.tree_widget.blockSignals(False)
+
+        # 4. 뷰포트(Cinematic View 및 Quad View 전체) 가시성 일괄 동기화
+        self.sync_outliner_visibility()
+
+    def sync_outliner_visibility(self):
+        """트리 위젯의 체크 상태에 맞춰 Quad 뷰포트 및 Cinematic View의 모든 액터 가시성을 완벽하게 동기화"""
+        checked_names = self.get_checked_item_names()
+        
+        # part_meshes에 존재하지만 뷰포트 액터에 아직 없는 체크된 메시 등록
+        for name in checked_names:
+            if name in getattr(self, 'part_meshes', {}) and self.part_meshes[name].n_cells > 0:
+                actor_exists = any(name in p.actors for p in self.viewport.plotters)
+                if not actor_exists:
+                    mesh = self.ensure_frontfaces_oriented(self.part_meshes[name], name=name, force=False)
+                    self.part_meshes[name] = mesh
+                    color = self.part_colors.get(name, [0.7, 0.7, 0.7])
+                    self.viewport.update_mesh(name, mesh, color)
+                    
+                    mat_info = None
+                    if hasattr(self, 'part_materials') and name in self.part_materials:
+                        mat_info = self.part_materials[name]
+                    elif getattr(self, 'last_applied_material', None) is not None:
+                        mat_info = self.last_applied_material
+                        
+                    if mat_info:
+                        self.viewport.update_mesh_pbr(
+                            name,
+                            color=mat_info.get('color', color),
+                            roughness=mat_info.get('roughness', 0.5),
+                            metallic=mat_info.get('metallic', 0.0),
+                            normal_scale=mat_info.get('normal_scale', 1.0),
+                            bright=mat_info.get('bright', 1.0),
+                            reflection=mat_info.get('reflection', 1.0),
+                            refraction=mat_info.get('refraction', 1.5),
+                            emissive=mat_info.get('emissive', 0.0),
+                            coat_strength=mat_info.get('coat_strength', 0.0),
+                            coat_roughness=mat_info.get('coat_roughness', 0.0),
+                            anisotropy=mat_info.get('anisotropy', 0.0),
+                            occlusion=mat_info.get('occlusion', 1.0),
+                            use_hdri=mat_info.get('use_hdri', True),
+                            hdri_ratio=mat_info.get('hdri_ratio', 1.0),
+                            use_roughness=mat_info.get('use_roughness', True),
+                            use_metallic=mat_info.get('use_metallic', True),
+                            use_normal=mat_info.get('use_normal', True),
+                            use_bright=mat_info.get('use_bright', True),
+                            use_reflection=mat_info.get('use_reflection', True),
+                            use_refraction=mat_info.get('use_refraction', True),
+                            use_emissive=mat_info.get('use_emissive', False),
+                            use_coat_strength=mat_info.get('use_coat_strength', False),
+                            use_coat_roughness=mat_info.get('use_coat_roughness', False),
+                            use_anisotropy=mat_info.get('use_anisotropy', False),
+                            use_occlusion=mat_info.get('use_occlusion', False),
+                            render=False
+                        )
+
+        ignore_names = {'bg_grid', 'axis_x', 'axis_y', 'view_name', 'Cinematic', 'dimensions', 
+                        'picked_cells', 'my_picked_cells', '_picked_through_selection', 
+                        '_picked_visible_selection', '_rectangle_selection_frustum'}
+
+        # 모든 플로터에 존재하는 부품 액터들의 가시성 일괄 적용 (체크 해제 시 100% 감춤 보장)
         for plotter in self.viewport.plotters:
-            for actor in plotter.renderer.actors.values():
-                if hasattr(actor, 'name') and actor.name == name:
-                    actor.SetVisibility(is_checked)
-            plotter.render()
+            for actor_name, actor in list(plotter.actors.items()):
+                if actor_name in ignore_names or actor_name.startswith('axis_') or actor_name.startswith('bg_'):
+                    continue
+                is_vis = (actor_name in checked_names)
+                try:
+                    actor.SetVisibility(is_vis)
+                    actor.SetPickable(is_vis)
+                except Exception:
+                    pass
+                        
+        self.viewport.render_active()
+
+        if getattr(self, 'picked_mesh', None) is not None:
+            self.picked_mesh = self.filter_mesh_by_checked_objects(self.picked_mesh)
+            self.update_picked_highlight()
+
+    def get_all_tree_item_names(self):
+        """트리 위젯의 모든 아이템 텍스트(오브젝트 이름) 세트 반환"""
+        names = set()
+        def _traverse(item):
+            for i in range(item.childCount()):
+                child = item.child(i)
+                names.add(child.text(0))
+                _traverse(child)
+        root = self.tree_widget.invisibleRootItem()
+        _traverse(root)
+        return names
+
+    def set_all_tree_items_check_state(self, checked: bool):
+        """트리 위젯의 모든 항목에 대해 체크/체크해제 상태를 일괄 적용하고, 부품 객체의 뷰포트 가시성을 동기화합니다."""
+        target_state = Qt.Checked if checked else Qt.Unchecked
+        
+        self.tree_widget.blockSignals(True)
+        
+        def _set_check_recursive(item):
+            item.setCheckState(0, target_state)
+            for i in range(item.childCount()):
+                _set_check_recursive(item.child(i))
+                
+        root = self.tree_widget.invisibleRootItem()
+        for i in range(root.childCount()):
+            _set_check_recursive(root.child(i))
+            
+        self.tree_widget.blockSignals(False)
+        
+        self.sync_outliner_visibility()
+
+    def get_checked_item_names(self):
+        """트리 위젯에서 체크박스가 Checked(체크됨) 상태인 모든 아이템의 텍스트(오브젝트 이름) 세트 반환"""
+        checked = set()
+        def _traverse(item):
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if child.checkState(0) == Qt.Checked:
+                    checked.add(child.text(0))
+                _traverse(child)
+        
+        root = self.tree_widget.invisibleRootItem()
+        _traverse(root)
+        return checked
+
+    def filter_mesh_by_checked_objects(self, mesh):
+        """주어진 mesh에서 계층구조상 체크된(Qt.Checked) 오브젝트들에 속하는 cell만 추출하여 반환"""
+        if mesh is None or not hasattr(mesh, 'n_cells') or mesh.n_cells == 0:
+            return None
+            
+        checked_names = self.get_checked_item_names()
+        if not checked_names:
+            return None
+            
+        import numpy as np
+        import pyvista as pv
+        
+        mesh_centers = mesh.cell_centers().points
+        keep_indices = set()
+        
+        for name in checked_names:
+            part_mesh = getattr(self, 'part_meshes', {}).get(name)
+            if part_mesh is None or part_mesh.n_cells == 0:
+                continue
+                
+            part_centers = part_mesh.cell_centers().points
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(mesh_centers)
+                indices_list = tree.query_ball_point(part_centers, r=0.001)
+                for indices in indices_list:
+                    if indices:
+                        keep_indices.update(indices)
+            except ImportError:
+                for pc in part_centers:
+                    dists = np.linalg.norm(mesh_centers - pc, axis=1)
+                    matches = np.where(dists < 0.001)[0]
+                    if len(matches) > 0:
+                        keep_indices.update(matches.tolist())
+                        
+        if not keep_indices:
+            return None
+            
+        filtered = mesh.extract_cells(list(keep_indices))
+        if not isinstance(filtered, pv.PolyData):
+            filtered = filtered.extract_surface(algorithm='dataset_surface')
+        return filtered
+
+    def update_picked_highlight(self):
+        """현재 self.picked_mesh 상태를 바탕으로 마젠타 선택 액터를 갱신"""
+        try:
+            self.viewport.plotter_single.remove_actor("my_picked_cells")
+        except Exception:
+            pass
+            
+        if getattr(self, 'picked_mesh', None) is not None and getattr(self.picked_mesh, 'n_cells', 0) > 0:
+            self.viewport.plotter_single.add_mesh(
+                self.picked_mesh, 
+                name="my_picked_cells", 
+                color="magenta", 
+                show_edges=True, 
+                line_width=3, 
+                pickable=False,
+                reset_camera=False
+            )
+        self.viewport.plotter_single.render()
 
     def on_render_arch(self):
         """팝업창(QDialog)을 띄우고 그 안에 인터랙티브 PyVista 뷰어를 넣어 사용자가 시네마틱 구도를 잡을 수 있게 합니다."""
@@ -709,22 +2775,86 @@ class MainWindow(QMainWindow):
             lbl_info.setStyleSheet("font-weight: bold; font-size: 14px; padding: 5px;")
             layout.addWidget(lbl_info)
             
+            # HDRI 환경맵 불러오기 툴바 레이아웃
+            hdri_bar_layout = QHBoxLayout()
+            btn_load_hdri = QPushButton("📂 HDRI 환경맵 불러오기")
+            btn_load_hdri.setCursor(Qt.PointingHandCursor)
+            btn_load_hdri.setStyleSheet("font-weight: bold; font-size: 13px; background-color: #2563EB; color: white; padding: 6px 14px; border-radius: 4px;")
+            
+            lbl_hdri_status = QLabel("현재 배경: 기본 스카이박스 (Skybox)")
+            lbl_hdri_status.setStyleSheet("font-weight: bold; font-size: 12px; color: #0044CC; background-color: #E8EEF9; padding: 5px 10px; border-radius: 4px; border: 1px solid #B0C4DE;")
+            
+            btn_reset_hdri = QPushButton("🔄 기본 배경 복원")
+            btn_reset_hdri.setCursor(Qt.PointingHandCursor)
+            btn_reset_hdri.setStyleSheet("font-weight: bold; font-size: 13px; background-color: #4B5563; color: white; padding: 6px 14px; border-radius: 4px;")
+            
+            hdri_bar_layout.addWidget(btn_load_hdri)
+            hdri_bar_layout.addWidget(lbl_hdri_status, stretch=1)
+            hdri_bar_layout.addWidget(btn_reset_hdri)
+            layout.addLayout(hdri_bar_layout)
+            
             # 대화형 PyVista 인터랙터 생성
             plotter = QtInteractor(dialog)
             layout.addWidget(plotter.interactor)
             
-            # HDRI 맵 및 환경 설정
-            cubemap = pv.examples.download_sky_box_cube_map()
-            plotter.set_environment_texture(cubemap)
-            
-            # 스카이박스의 위쪽 축을 Z축(0,0,1)으로 설정하여 올바른 하늘 방향을 잡습니다
-            skybox = cubemap.to_skybox()
+            # 헬퍼 함수: 스카이박스 및 PBR IBL 환경맵 적용 (하늘이 위로 가도록 X축 90도 회전 보정)
+            def apply_skybox_texture(tex_or_cubemap):
+                try:
+                    plotter.remove_actor("skybox")
+                except Exception:
+                    pass
+                    
+                try:
+                    plotter.set_environment_texture(tex_or_cubemap)
+                except Exception:
+                    pass
+                    
+                try:
+                    skybox_actor = tex_or_cubemap.to_skybox()
+                    # VTK 스카이박스의 축을 Y-up에서 Z-up(하늘 위쪽)으로 올바르게 X축 90도 회전 보정
+                    skybox_actor.RotateX(90)
+                    plotter.add_actor(skybox_actor, name="skybox")
+                except Exception as e:
+                    print(f"Skybox 생성 오류: {e}")
+
+            # 기본 HDRI 맵 및 환경 설정
             try:
-                skybox.SetFloorPlane(0, 0, 1, 0)
-                skybox.SetFloorRight(1, 0, 0)
-            except:
-                pass
-            plotter.add_actor(skybox)
+                default_cubemap = pv.examples.download_sky_box_cube_map()
+                apply_skybox_texture(default_cubemap)
+            except Exception as e:
+                print(f"기본 스카이박스 로드 예외: {e}")
+                
+            from PySide6.QtWidgets import QFileDialog
+            from viewport_widget import read_hdri_texture
+
+            def choose_hdri_in_dialog():
+                file_path, _ = QFileDialog.getOpenFileName(
+                    dialog,
+                    "HDRI 환경맵 파일 선택",
+                    "",
+                    "HDRI Image Files (*.hdr *.exr *.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff);;All Files (*.*)"
+                )
+                if file_path and os.path.exists(file_path):
+                    try:
+                        tex = read_hdri_texture(file_path)
+                        apply_skybox_texture(tex)
+                        file_name = os.path.basename(file_path)
+                        lbl_hdri_status.setText(f"현재 배경 HDRI: {file_name}")
+                        plotter.render()
+                    except Exception as err:
+                        QMessageBox.warning(dialog, "HDRI 로드 오류", f"HDRI 환경맵 로드 중 오류가 발생했습니다:\n{err}")
+
+            def reset_hdri_in_dialog():
+                try:
+                    default_cubemap = pv.examples.download_sky_box_cube_map()
+                    apply_skybox_texture(default_cubemap)
+                    lbl_hdri_status.setText("현재 배경: 기본 스카이박스 (Skybox)")
+                    plotter.render()
+                except Exception as err:
+                    print(f"기본 배경 복원 오류: {err}")
+
+            btn_load_hdri.clicked.connect(choose_hdri_in_dialog)
+            btn_reset_hdri.clicked.connect(reset_hdri_in_dialog)
             
             try:
                 plotter.enable_shadows()
@@ -735,7 +2865,7 @@ class MainWindow(QMainWindow):
             # 현재 뷰어의 로드된 액터(메쉬)들 복제
             orig_plotter = self.viewport.plotter_single
             for name, actor in orig_plotter.actors.items():
-                if name in ["Axes", "Grid", "Border"] or "axes" in name.lower() or "grid" in name.lower():
+                if name in ["Axes", "Grid", "Border", "skybox"] or "axes" in name.lower() or "grid" in name.lower() or "skybox" in name.lower():
                     continue
                     
                 if hasattr(actor, 'mapper') and hasattr(actor.mapper, 'dataset'):
@@ -744,14 +2874,17 @@ class MainWindow(QMainWindow):
                         continue
                         
                     color = actor.prop.color if hasattr(actor.prop, 'color') else 'white'
-                    new_actor = plotter.add_mesh(mesh, color=color, show_edges=False)
+                    new_actor = plotter.add_mesh(mesh, name=name, color=color, show_edges=False)
                     
-                    # PBR 재질 부여
+                    # PBR 재질 및 양면 렌더링(Two-Sided) 부여
                     try:
                         new_actor.prop.interpolation = 'pbr'
-                        new_actor.prop.metallic = 0.8
-                        new_actor.prop.roughness = 0.15
-                    except:
+                        if hasattr(actor.prop, 'metallic'): new_actor.prop.metallic = actor.prop.metallic
+                        if hasattr(actor.prop, 'roughness'): new_actor.prop.roughness = actor.prop.roughness
+                        new_actor.prop.SetBackfaceCulling(False)
+                        new_actor.prop.SetFrontfaceCulling(False)
+                        new_actor.SetBackfaceProperty(new_actor.prop)
+                    except Exception:
                         pass
                         
             # 초기 카메라 동기화
@@ -846,13 +2979,116 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"바인딩 중 오류 발생: {str(e)}")
 
+    def on_apply_material_slot(self, mat_info):
+        """선택한 PBR 머티리얼 파라미터(알베도 컬러, Roughness, Metallic 등)를 계층구조에서 체크된 오브젝트들에 즉시 반영"""
+        checked_names = self.get_checked_item_names()
+        if not checked_names:
+            QMessageBox.information(self, "대상 없음", "재질을 적용할 오브젝트를 계층구조(Outliner)에서 먼저 체크해 주세요.")
+            return
+            
+        color = mat_info.get('color', [0.8, 0.8, 0.8])
+        name_str = mat_info.get('name', 'Preset')
+        bright = mat_info.get('bright', 1.0)
+        roughness = mat_info.get('roughness', 0.5)
+        metallic = mat_info.get('metallic', 0.0)
+        normal_scale = mat_info.get('normal_scale', 1.0)
+        reflection = mat_info.get('reflection', 1.0)
+        refraction = mat_info.get('refraction', 1.5)
+        emissive = mat_info.get('emissive', 0.0)
+        coat_strength = mat_info.get('coat_strength', 0.0)
+        coat_roughness = mat_info.get('coat_roughness', 0.0)
+        anisotropy = mat_info.get('anisotropy', 0.0)
+        occlusion = mat_info.get('occlusion', 1.0)
+        
+        hdri_path = mat_info.get('hdri_path')
+        use_hdri = mat_info.get('use_hdri', True)
+        hdri_ratio = mat_info.get('hdri_ratio', 1.0)
+        use_bright = mat_info.get('use_bright', True)
+        use_roughness = mat_info.get('use_roughness', True)
+        use_metallic = mat_info.get('use_metallic', True)
+        use_normal = mat_info.get('use_normal', True)
+        use_reflection = mat_info.get('use_reflection', True)
+        use_refraction = mat_info.get('use_refraction', True)
+        use_emissive = mat_info.get('use_emissive', False)
+        use_coat_strength = mat_info.get('use_coat_strength', False)
+        use_coat_roughness = mat_info.get('use_coat_roughness', False)
+        use_anisotropy = mat_info.get('use_anisotropy', False)
+        use_occlusion = mat_info.get('use_occlusion', False)
+
+        # 머티리얼 적용 시 현재 뷰포트 디스플레이 모드가 solid나 wireframe이면 머티리얼 프리뷰(material_preview) 모드로 자동 전환
+        if getattr(self.viewport, 'current_render_mode', None) in ["solid", "wireframe"]:
+            self.viewport.set_display_render_mode("material_preview")
+
+        if hdri_path and os.path.exists(hdri_path) and use_hdri:
+            self.viewport.set_hdri_environment(hdri_path, force=True)
+        else:
+            self.viewport.remove_hdri_environment()
+        
+        self.last_applied_material = mat_info
+        if not hasattr(self, 'part_materials'):
+            self.part_materials = {}
+
+        count = 0
+        for name in checked_names:
+            if name in getattr(self, 'part_meshes', {}) and self.part_meshes[name].n_cells > 0:
+                self.part_colors[name] = color
+                self.part_materials[name] = mat_info
+                
+                # 머티리얼 적용 대상 부품의 외부 앞면(Frontface) 방향 및 법선(Normals) 재배향 보장 (락이 걸린 메쉬는 보존)
+                fixed_mesh = self.ensure_frontfaces_oriented(self.part_meshes[name], name=name, force=False)
+                self.part_meshes[name] = fixed_mesh
+
+                # 뷰포트 액터에 정렬 및 락(Lock)이 적용된 최신 PolyData 메쉬 버퍼 100% 갱신 등록
+                self.viewport.update_mesh(name, fixed_mesh, color)
+
+                # 개별 오브젝트마다 렌더링하지 않고 render=False로 속성만 일괄 변경
+                self.viewport.update_mesh_pbr(
+                    name, color=color, roughness=roughness, metallic=metallic, normal_scale=normal_scale,
+                    bright=bright, reflection=reflection, refraction=refraction,
+                    emissive=emissive, coat_strength=coat_strength, coat_roughness=coat_roughness,
+                    anisotropy=anisotropy, occlusion=occlusion,
+                    use_hdri=use_hdri, hdri_ratio=hdri_ratio,
+                    use_roughness=use_roughness, use_metallic=use_metallic, use_normal=use_normal,
+                    use_bright=use_bright, use_reflection=use_reflection, use_refraction=use_refraction,
+                    use_emissive=use_emissive, use_coat_strength=use_coat_strength,
+                    use_coat_roughness=use_coat_roughness, use_anisotropy=use_anisotropy, use_occlusion=use_occlusion,
+                    render=False
+                )
+                
+                # 아웃라이너 트리의 색상 아이콘도 업데이트
+                root = self.tree_widget.invisibleRootItem()
+                def _update_icon(item):
+                    for i in range(item.childCount()):
+                        child = item.child(i)
+                        if child.text(0) == name:
+                            pixmap = QPixmap(16, 16)
+                            pixmap.fill(QColor(int(color[0]*255), int(color[1]*255), int(color[2]*255)))
+                            child.setIcon(0, QIcon(pixmap))
+                        _update_icon(child)
+                _update_icon(root)
+                count += 1
+                
+        if count > 0:
+            # 모든 오브젝트의 머티리얼 적용이 완료된 후 단 1회만 최적 렌더링
+            self.viewport.render_active()
+            log_action("APPLY_MATERIAL_SUCCESS", f"머티리얼: '{name_str}', 적용 부품 수: {count}개, Roughness: {roughness:.2f}, Metallic: {metallic:.2f}")
+            
+            total_parts = len(getattr(self, 'part_meshes', {}))
+            msg = f"'{name_str}' 머티리얼 (Roughness: {roughness:.2f}, Metallic: {metallic:.2f})이 아웃라이너에서 체크된 {count}개 오브젝트에 정상 반영되었습니다."
+            if count < total_parts:
+                msg += f"\n\n💡 [안내] 현재 전체 {total_parts}개 부품 중 {count}개만 체크되어 있어 체크된 부품에만 재질이 변경되었습니다.\n차체 외관을 포함한 전체 오브젝트에 일괄 적용하려면 아웃라이너 좌측 상단의 [☑ 전체 선택] 버튼을 누른 후 머티리얼을 적용하세요!"
+            QMessageBox.information(self, "PBR 재질 적용 완료", msg)
+
     def on_load_hdri(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "HDRI 맵 불러오기", "", "HDR/EXR Files (*.hdr *.exr);;All Images (*.png *.jpg)")
         if file_path:
+            log_action("LOAD_HDRI_START", f"파일 경로: {file_path}")
             success = self.viewport.set_hdri_environment(file_path)
             if success:
+                log_action("LOAD_HDRI_SUCCESS", f"적용 성공: {os.path.basename(file_path)}")
                 QMessageBox.information(self, "Success", "HDRI 환경 맵이 성공적으로 적용되었습니다.")
             else:
+                log_action("LOAD_HDRI_FAIL", f"적용 실패: {os.path.basename(file_path)}")
                 QMessageBox.warning(self, "Error", "HDRI 환경 맵 적용에 실패했습니다.")
 
     def on_generate_hdri(self):
@@ -909,7 +3145,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "PBR 머티리얼 적용에 실패했습니다.")
 
     def on_save_anf(self):
-        """현재 프로젝트 상태를 .anf 형식으로 저장"""
+        """현재 프로젝트 상태(메시, 아웃라이너, 개별 PBR 재질 수치, 텍스처 파일, 재질 슬롯 목록 등 모든 작업 내용)를 .anf 형식으로 저장"""
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "AI NanoStudio Format (*.anf)")
         if not file_path: return False
         import json, zipfile, tempfile, shutil, os
@@ -917,29 +3153,134 @@ class MainWindow(QMainWindow):
         
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                metadata = {"parts": [], "colors": {}, "visibility": {}}
-                root = self.tree_widget.invisibleRootItem()
-                for i in range(root.childCount()):
-                    item = root.child(i)
-                    name = item.text(0)
-                    metadata["parts"].append(name)
-                    metadata["visibility"][name] = (item.checkState(0) == Qt.Checked)
-                    if name in getattr(self, 'part_colors', {}):
-                        metadata["colors"][name] = self.part_colors[name]
-                    if name in getattr(self, 'part_meshes', {}):
-                        mesh_path = os.path.join(tmpdir, f"{name}.vtp")
-                        self.part_meshes[name].save(mesh_path)
+                textures_dir = os.path.join(tmpdir, "textures")
+                meshes_dir = os.path.join(tmpdir, "meshes")
+                os.makedirs(textures_dir, exist_ok=True)
+                os.makedirs(meshes_dir, exist_ok=True)
+                
+                saved_file_map = {}
+                
+                def bundle_file(src_path):
+                    if not src_path or not os.path.exists(src_path):
+                        return None
+                    abs_src = os.path.abspath(src_path)
+                    if abs_src in saved_file_map:
+                        return saved_file_map[abs_src]
+                    
+                    filename = os.path.basename(abs_src)
+                    dest_name = filename
+                    counter = 1
+                    dest_path = os.path.join(textures_dir, dest_name)
+                    while os.path.exists(dest_path):
+                        name_no_ext, ext_str = os.path.splitext(filename)
+                        dest_name = f"{name_no_ext}_{counter}{ext_str}"
+                        dest_path = os.path.join(textures_dir, dest_name)
+                        counter += 1
+                    try:
+                        shutil.copy2(abs_src, dest_path)
+                        rel_path = f"textures/{dest_name}"
+                        saved_file_map[abs_src] = rel_path
+                        return rel_path
+                    except Exception as err:
+                        print(f"파일 패키징 실패 ({src_path}): {err}")
+                        return None
+
+                def process_mat_dict(m_dict):
+                    if not m_dict or not isinstance(m_dict, dict):
+                        return m_dict
+                    m_copy = dict(m_dict)
+                    path_keys = [
+                        ("hdri_path", "hdri_rel_path"),
+                        ("texture_path", "texture_rel_path"),
+                        ("roughness_map", "roughness_rel_map"),
+                        ("metallic_map", "metallic_rel_map"),
+                        ("normal_map", "normal_rel_map"),
+                        ("disp_map", "disp_rel_map"),
+                        ("orm_map", "orm_rel_map"),
+                    ]
+                    for abs_k, rel_k in path_keys:
+                        if m_copy.get(abs_k):
+                            rel_p = bundle_file(m_copy[abs_k])
+                            if rel_p:
+                                m_copy[rel_k] = rel_p
+                    return m_copy
+
+                metadata = {
+                    "version": "2.1",
+                    "parts": [],
+                    "mesh_files": {}, # part_name -> rel_vtp_path
+                    "colors": {},
+                    "visibility": {},
+                    "part_materials": {},
+                    "slot_materials": [],
+                    "viewport_hdri_rel_path": None,
+                    "last_applied_material": None
+                }
+
+                # 1. 아웃라이너 부품 계층 및 가시성 수집 (재귀적 탐색)
+                def collect_tree_items(parent_item):
+                    for i in range(parent_item.childCount()):
+                        item = parent_item.child(i)
+                        name = item.text(0)
+                        if name not in metadata["parts"]:
+                            metadata["parts"].append(name)
+                        metadata["visibility"][name] = (item.checkState(0) == Qt.Checked)
+                        collect_tree_items(item)
+
+                collect_tree_items(self.tree_widget.invisibleRootItem())
+
+                # 2. part_meshes에 등록된 모든 메시 100% 완전 저장
+                if hasattr(self, 'part_meshes') and self.part_meshes:
+                    for idx, (name, mesh) in enumerate(self.part_meshes.items()):
+                        if name not in metadata["parts"]:
+                            metadata["parts"].append(name)
+                            metadata["visibility"][name] = True
+                        if hasattr(self, 'part_colors') and name in self.part_colors:
+                            metadata["colors"][name] = self.part_colors[name]
+                        
+                        vtp_filename = f"part_{idx}.vtp"
+                        vtp_rel_path = f"meshes/{vtp_filename}"
+                        vtp_abs_path = os.path.join(meshes_dir, vtp_filename)
+                        try:
+                            mesh.save(vtp_abs_path)
+                            metadata["mesh_files"][name] = vtp_rel_path
+                        except Exception as e_vtp:
+                            print(f"메시 VTP 저장 실패 ({name}): {e_vtp}")
+
+                # 3. 개별 부품별 PBR 재질 수치 및 HDRI / 텍스처 경로 저장
+                if hasattr(self, 'part_materials') and self.part_materials:
+                    for p_name, m_info in self.part_materials.items():
+                        metadata["part_materials"][p_name] = process_mat_dict(m_info)
+
+                # 4. 하단 재질 슬롯 목록 (최대 100개 슬롯의 재질 이름, 수치, HDRI/텍스처 패키징)
+                if hasattr(self, 'mat_slot_panel') and hasattr(self.mat_slot_panel, 'materials'):
+                    for slot_info in self.mat_slot_panel.materials:
+                        metadata["slot_materials"].append(process_mat_dict(slot_info))
+
+                # 5. 메인 뷰포트 배경 HDRI 경로 패키징
+                if hasattr(self.viewport, 'hdri_path') and self.viewport.hdri_path:
+                    metadata["viewport_hdri_rel_path"] = bundle_file(self.viewport.hdri_path)
+
+                # 6. 최근 적용된 재질 정보 저장
+                if getattr(self, 'last_applied_material', None) is not None:
+                    metadata["last_applied_material"] = process_mat_dict(self.last_applied_material)
+
+                # 메타데이터 JSON 파일 기록
                 with open(os.path.join(tmpdir, "metadata.json"), "w", encoding="utf-8") as f:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+                # 전체 tempdir 압축 (.anf)
                 with zipfile.ZipFile(file_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for root_dir, _, files in os.walk(tmpdir):
                         for f in files:
                             abs_path = os.path.join(root_dir, f)
                             zf.write(abs_path, arcname=os.path.relpath(abs_path, tmpdir))
-            QMessageBox.information(self, "저장 완료", "프로젝트가 성공적으로 저장되었습니다.")
+
+            QMessageBox.information(self, "저장 완료", "모든 메시, 텍스처 파일, PBR 재질 수치 및 슬롯 정보가 성공적으로 저장되었습니다.")
+            self.update_window_title(file_path)
             return True
         except Exception as e:
-            QMessageBox.critical(self, "저장 오류", f"저장 중 오류 발생:\n{e}")
+            QMessageBox.critical(self, "저장 오류", f"프로젝트 저장 중 오류 발생:\n{e}")
             return False
 
     def reset_project(self):
@@ -949,10 +3290,13 @@ class MainWindow(QMainWindow):
             self.part_meshes = {}
         if hasattr(self, 'part_colors'):
             self.part_colors = {}
+        if hasattr(self, 'part_materials'):
+            self.part_materials = {}
         self.tree_widget.clear()
         self.viewport.clear_and_setup()
         self.btn_ai_texture.setEnabled(False)
         self.btn_unwrap.setEnabled(False)
+        self.update_window_title()
         # 렌더링 강제 업데이트
         for plotter in getattr(self.viewport, 'plotters', []):
             plotter.render()
@@ -983,58 +3327,351 @@ class MainWindow(QMainWindow):
             pass
 
     def on_load_anf(self):
-        """저장된 .anf 프로젝트 불러오기"""
+        """저장된 .anf 프로젝트 불러오기 (메시, PBR 재질 수치, 텍스처 파일, 재질 슬롯 목록 100% 복원)"""
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Project", "", "AI NanoStudio Format (*.anf)")
         if not file_path: return
-        import json, zipfile, tempfile, os
+        import json, zipfile, os
         import pyvista as pv
         
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                with zipfile.ZipFile(file_path, 'r') as zf:
-                    zf.extractall(tmpdir)
-                with open(os.path.join(tmpdir, "metadata.json"), "r", encoding="utf-8") as f:
-                    metadata = json.load(f)
-                    
-                self.part_meshes = {}
-                self.part_colors = {}
-                self.tree_widget.clear()
-                
-                # 기존 뷰포트 초기화
-                for plotter in getattr(self.viewport, 'plotters', []):
-                    plotter.clear()
-                self.viewport.setup_viewport_aesthetics()
-                
-                # 데이터 복원
-                for name in metadata["parts"]:
-                    mesh_path = os.path.join(tmpdir, f"{name}.vtp")
-                    if os.path.exists(mesh_path):
+            log_action("LOAD_ANF_START", f"프로젝트 불러오기 시작: {file_path}")
+            # 텍스처 및 번들 파일이 유지되도록 영구 캐시 디렉토리에 압축 해제
+            cache_dir = os.path.join(BASE_DIR, "logs", "anf_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                zf.extractall(cache_dir)
+            with open(os.path.join(cache_dir, "metadata.json"), "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            def resolve_bundled_file(rel_path):
+                if not rel_path:
+                    return None
+                abs_p = os.path.join(cache_dir, rel_path)
+                if os.path.exists(abs_p):
+                    return abs_p
+                return None
+
+            def restore_mat_dict(m_dict):
+                if not m_dict or not isinstance(m_dict, dict):
+                    return m_dict
+                m_copy = dict(m_dict)
+                path_keys = [
+                    ("hdri_path", "hdri_rel_path"),
+                    ("texture_path", "texture_rel_path"),
+                    ("roughness_map", "roughness_rel_map"),
+                    ("metallic_map", "metallic_rel_map"),
+                    ("normal_map", "normal_rel_map"),
+                    ("disp_map", "disp_rel_map"),
+                    ("orm_map", "orm_rel_map"),
+                ]
+                for abs_k, rel_k in path_keys:
+                    if m_copy.get(rel_k):
+                        abs_p = resolve_bundled_file(m_copy[rel_k])
+                        if abs_p:
+                            m_copy[abs_k] = abs_p
+                return m_copy
+
+            self.part_meshes = {}
+            self.part_colors = {}
+            self.part_materials = {}
+            self.tree_widget.clear()
+            
+            # 기존 뷰포트 초기화 및 조명/그리드 완벽 재설정
+            self.viewport.clear_and_setup()
+
+            # 1. 하단 재질 슬롯 목록 (100개 슬롯) 복원
+            if metadata.get("slot_materials") and hasattr(self, 'mat_slot_panel'):
+                restored_slots = []
+                for slot_info in metadata["slot_materials"]:
+                    restored_slots.append(restore_mat_dict(slot_info))
+                self.mat_slot_panel.materials = restored_slots
+                self.mat_slot_panel.rebuild_grid_ui()
+
+            # 2. 메인 뷰포트 HDRI 배경 복원
+            v_hdri_rel = metadata.get("viewport_hdri_rel_path")
+            if v_hdri_rel:
+                abs_v_hdri = resolve_bundled_file(v_hdri_rel)
+                if abs_v_hdri and os.path.exists(abs_v_hdri):
+                    self.viewport.set_hdri_environment(abs_v_hdri, force=True)
+
+            # 3. 부품 메시, 색상, 가시성 및 개별 PBR 재질 수치 복원
+            mesh_files = metadata.get("mesh_files") or {}
+            
+            for name in metadata.get("parts", []):
+                # 신버전 mesh_files 매핑 또는 기본 {name}.vtp 읽기
+                mesh_rel_path = mesh_files.get(name) if mesh_files else None
+                if mesh_rel_path:
+                    mesh_path = os.path.join(cache_dir, mesh_rel_path)
+                else:
+                    mesh_path = os.path.join(cache_dir, f"{name}.vtp")
+
+                if os.path.exists(mesh_path):
+                    try:
                         self.part_meshes[name] = pv.read(mesh_path)
-                    if name in metadata.get("colors", {}):
-                        self.part_colors[name] = metadata["colors"][name]
-                    visibility = metadata.get("visibility", {}).get(name, True)
-                    
-                    item = QTreeWidgetItem([name])
-                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                    item.setCheckState(0, Qt.Checked if visibility else Qt.Unchecked)
-                    self.tree_widget.addTopLevelItem(item)
-                    
-                    # 체크되어 있으면 화면에 표시
-                    if visibility and name in self.part_meshes:
-                        self.viewport.update_mesh(name, self.part_meshes[name], self.part_colors.get(name, "gray"))
-                        
-                for plotter in getattr(self.viewport, 'plotters', []):
-                    plotter.reset_camera()
-                    plotter.render()
+                    except Exception as err_m:
+                        print(f"메시 로드 실패 ({name}): {err_m}")
+
+                color = metadata.get("colors", {}).get(name, [0.8, 0.8, 0.8])
+                self.part_colors[name] = color
+
+                if "part_materials" in metadata and metadata["part_materials"] and name in metadata["part_materials"]:
+                    self.part_materials[name] = restore_mat_dict(metadata["part_materials"][name])
+
+                visibility = metadata.get("visibility", {}).get(name, True)
                 
-                self.update_dimensions_text()
+                # 아웃라이너 트리 아이템 생성 및 색상 아이콘 등록
+                item = QTreeWidgetItem([name])
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                item.setCheckState(0, Qt.Checked if visibility else Qt.Unchecked)
+                item.setData(0, Qt.UserRole, name)
                 
-            QMessageBox.information(self, "불러오기 완료", "프로젝트를 성공적으로 불러왔습니다.")
+                pixmap = QPixmap(16, 16)
+                pixmap.fill(QColor(int(color[0]*255), int(color[1]*255), int(color[2]*255)))
+                item.setIcon(0, QIcon(pixmap))
+                self.tree_widget.addTopLevelItem(item)
+                
+                # 메쉬가 존재하면 모든 플로터에 등록
+                if name in self.part_meshes:
+                    mesh = self.part_meshes[name]
+                    self.viewport.add_mesh_to_all(mesh, name=name, color=color)
+                    
+                    # 가시성이 꺼져 있다면 액터 제거
+                    if not visibility:
+                        for p in self.viewport.plotters:
+                            try:
+                                p.remove_actor(name)
+                            except Exception:
+                                pass
+                    
+                    # 저장된 커스텀 PBR 재질 수치가 있다면 반영
+                    if name in self.part_materials:
+                        mat_info = self.part_materials[name]
+                        self.viewport.update_mesh_pbr(
+                            name,
+                            color=mat_info.get('color', color),
+                            roughness=mat_info.get('roughness', 0.5),
+                            metallic=mat_info.get('metallic', 0.0),
+                            normal_scale=mat_info.get('normal_scale', 1.0),
+                            bright=mat_info.get('bright', 1.0),
+                            reflection=mat_info.get('reflection', 1.0),
+                            refraction=mat_info.get('refraction', 1.5),
+                            emissive=mat_info.get('emissive', 0.0),
+                            coat_strength=mat_info.get('coat_strength', 0.0),
+                            coat_roughness=mat_info.get('coat_roughness', 0.0),
+                            anisotropy=mat_info.get('anisotropy', 0.0),
+                            occlusion=mat_info.get('occlusion', 1.0),
+                            use_hdri=mat_info.get('use_hdri', True),
+                            hdri_ratio=mat_info.get('hdri_ratio', 1.0),
+                            use_roughness=mat_info.get('use_roughness', True),
+                            use_metallic=mat_info.get('use_metallic', True),
+                            use_normal=mat_info.get('use_normal', True),
+                            use_bright=mat_info.get('use_bright', True),
+                            use_reflection=mat_info.get('use_reflection', True),
+                            use_refraction=mat_info.get('use_refraction', True),
+                            use_emissive=mat_info.get('use_emissive', False),
+                            use_coat_strength=mat_info.get('use_coat_strength', False),
+                            use_coat_roughness=mat_info.get('use_coat_roughness', False),
+                            use_anisotropy=mat_info.get('use_anisotropy', False),
+                            use_occlusion=mat_info.get('use_occlusion', False),
+                            render=False
+                        )
+
+            # 4. 최근 적용된 재질 복원
+            if metadata.get("last_applied_material"):
+                self.last_applied_material = restore_mat_dict(metadata["last_applied_material"])
+
+            # 5. 디스플레이 렌더 모드 동기화 (기본: material_preview)
+            curr_mode = getattr(self.viewport, 'current_render_mode', 'material_preview')
+            self.viewport.set_display_render_mode(curr_mode)
+
+            # 6. 카메라 및 뷰포트 전체 재설정 (복원된 모든 객체가 한눈에 꽉 차게 보이도록)
+            self.viewport.reset_camera()
+            self.update_dimensions_text()
+            self.update_window_title(file_path)
+            
+            log_action("LOAD_ANF_SUCCESS", f"프로젝트 복원 성공: {os.path.basename(file_path)} | 부품 수: {len(self.part_meshes)}개")
+            QMessageBox.information(self, "불러오기 완료", f"프로젝트({len(self.part_meshes)}개 부품, 색상 및 PBR 설정)를 성공적으로 불러왔습니다.")
         except Exception as e:
-            QMessageBox.critical(self, "불러오기 오류", f"불러오기 중 오류 발생:\n{e}")
+            log_action("LOAD_ANF_ERROR", f"불러오기 실패: {e}")
+            QMessageBox.critical(self, "불러오기 오류", f"프로젝트 불러오기 중 오류 발생:\n{e}")
+
+    def get_model_center(self):
+        """전체 모델의 통합 중심점(Center) 반환 (개별 로컬 부품 오목함 반전 버그 방지)"""
+        if not hasattr(self, 'part_meshes') or not self.part_meshes:
+            return [0.0, 0.0, 0.0]
+        try:
+            bounds = [float('inf'), float('-inf'), float('inf'), float('-inf'), float('inf'), float('-inf')]
+            for m in self.part_meshes.values():
+                if m is not None and hasattr(m, 'bounds'):
+                    b = m.bounds
+                    bounds[0] = min(bounds[0], b[0])
+                    bounds[1] = max(bounds[1], b[1])
+                    bounds[2] = min(bounds[2], b[2])
+                    bounds[3] = max(bounds[3], b[3])
+                    bounds[4] = min(bounds[4], b[4])
+                    bounds[5] = max(bounds[5], b[5])
+            if bounds[0] != float('inf'):
+                return [(bounds[0]+bounds[1])/2.0, (bounds[2]+bounds[3])/2.0, (bounds[4]+bounds[5])/2.0]
+        except Exception:
+            pass
+        return [0.0, 0.0, 0.0]
+
+    def ensure_frontfaces_oriented(self, mesh, name=None, force=False):
+        """3D 메쉬의 법선(Normal)을 매끈하고 일관되게 정렬하며, 타이어/내부 면 등 오목한 유기적 입체가 뒤집히거나 구멍이 뚫리지 않도록 100% 매니폴드 정방향 법선 보정
+        """
+        if mesh is None or not hasattr(mesh, 'n_cells') or mesh.n_cells == 0:
+            return mesh
+            
+        # 이미 면 방향 락(Lock)이 걸려있는 메쉬이고 강제(force=True)가 아니면 재반전을 차단하고 그대로 유지
+        is_locked = False
+        if not force:
+            if hasattr(mesh, 'user_dict') and isinstance(mesh.user_dict, dict) and mesh.user_dict.get('frontface_locked', False):
+                is_locked = True
+            elif name and hasattr(self, 'frontface_locked_parts') and name in self.frontface_locked_parts:
+                is_locked = True
+                
+        if is_locked:
+            return mesh
+
+        try:
+            import numpy as np
+            
+            # 1. 메시 전반의 위상 일관성(Manifold Consistency) 보장 법선 계산 (개별 삼각형을 찢지 않음)
+            oriented = mesh.compute_normals(
+                cell_normals=True,
+                point_normals=True,
+                consistent_normals=True,
+                auto_orient_normals=True,
+                split_vertices=False,
+                feature_angle=60,
+                inplace=False
+            )
+            
+            # 2. 오브젝트 자체의 중심(part_center) 대비 외곽 표면의 대다수가 반전(Inverted)된 메쉬인지 검사
+            # (개별 삼각셀 단위로 쪼개서 뒤집는 대신 전체 메쉬 위상을 일관되게 유지)
+            part_center = oriented.center
+            cell_centers = oriented.cell_centers().points
+            cell_normals = oriented.cell_data.get('Normals')
+            
+            if cell_normals is not None and len(cell_normals) == len(cell_centers):
+                vecs = cell_centers - np.array(part_center)
+                norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                unit_vecs = vecs / norms
+                
+                dots = np.sum(unit_vecs * cell_normals, axis=1)
+                
+                # 외각 표면의 65% 이상이 파트 중심을 향하고 있다면 전체 메쉬 순서를 통으로 반전
+                if np.mean(dots < 0) > 0.65:
+                    faces = oriented.faces.copy()
+                    offset = 0
+                    while offset < len(faces):
+                        n_verts = faces[offset]
+                        if n_verts >= 3:
+                            faces[offset + 1], faces[offset + 2] = faces[offset + 2], faces[offset + 1]
+                        offset += (n_verts + 1)
+                    oriented.faces = faces
+                    oriented = oriented.compute_normals(
+                        cell_normals=True,
+                        point_normals=True,
+                        consistent_normals=True,
+                        auto_orient_normals=True,
+                        split_vertices=False,
+                        feature_angle=60,
+                        inplace=False
+                    )
+            
+            # 3. 정렬 완료 후 락(Lock) 상태 등록
+            if not hasattr(oriented, 'user_dict') or oriented.user_dict is None:
+                oriented.user_dict = {}
+            oriented.user_dict['frontface_locked'] = True
+            if name and hasattr(self, 'frontface_locked_parts'):
+                self.frontface_locked_parts.add(name)
+                
+            return oriented
+        except Exception as e:
+            print(f"Normal orient error: {e}")
+            return mesh
+
+    def orient_all_frontfaces(self, silent=False):
+        """스케치업/CAD 모델의 모든 뒤집힌 면(Backface)을 외부 앞면(Frontface) 방향으로 100% 자동 통일 정렬 및 락(Lock) 고정"""
+        if not hasattr(self, 'part_meshes') or not self.part_meshes:
+            if not silent:
+                QMessageBox.information(self, "데이터 없음", "먼저 3D 모델을 불러와주세요.")
+            return
+
+        # 아웃라이너 체크 여부와 관계없이 모델의 '전체 부품 메시'에 대해 일괄 면 방향 통일 처리
+        target_names = list(self.part_meshes.keys())
+
+        if not target_names:
+            if not silent:
+                QMessageBox.information(self, "대상 없음", "면 방향을 정렬할 오브젝트가 선택되지 않았습니다.")
+            return
+
+        count = 0
+        for name in target_names:
+            if name in self.part_meshes and self.part_meshes[name].n_cells > 0:
+                try:
+                    mesh = self.part_meshes[name]
+                    # 수동 통일 실행 시 force=True로 면 방향 재배향 후 락(Lock) 설정
+                    fixed_mesh = self.ensure_frontfaces_oriented(mesh, name=name, force=True)
+                    self.part_meshes[name] = fixed_mesh
+                    color = self.part_colors.get(name, [0.8, 0.8, 0.8])
+                    self.viewport.update_mesh(name, fixed_mesh, color)
+                    
+                    mat_info = None
+                    if hasattr(self, 'part_materials') and name in self.part_materials:
+                        mat_info = self.part_materials[name]
+                    elif getattr(self, 'last_applied_material', None) is not None:
+                        mat_info = self.last_applied_material
+
+                    if mat_info:
+                        self.viewport.update_mesh_pbr(
+                            name,
+                            color=mat_info.get('color', color),
+                            roughness=mat_info.get('roughness', 0.5),
+                            metallic=mat_info.get('metallic', 0.0),
+                            normal_scale=mat_info.get('normal_scale', 1.0),
+                            bright=mat_info.get('bright', 1.0),
+                            reflection=mat_info.get('reflection', 1.0),
+                            refraction=mat_info.get('refraction', 1.5),
+                            emissive=mat_info.get('emissive', 0.0),
+                            coat_strength=mat_info.get('coat_strength', 0.0),
+                            coat_roughness=mat_info.get('coat_roughness', 0.0),
+                            anisotropy=mat_info.get('anisotropy', 0.0),
+                            occlusion=mat_info.get('occlusion', 1.0),
+                            use_hdri=mat_info.get('use_hdri', True),
+                            hdri_ratio=mat_info.get('hdri_ratio', 1.0),
+                            use_roughness=mat_info.get('use_roughness', True),
+                            use_metallic=mat_info.get('use_metallic', True),
+                            use_normal=mat_info.get('use_normal', True),
+                            use_bright=mat_info.get('use_bright', True),
+                            use_reflection=mat_info.get('use_reflection', True),
+                            use_refraction=mat_info.get('use_refraction', True),
+                            use_emissive=mat_info.get('use_emissive', False),
+                            use_coat_strength=mat_info.get('use_coat_strength', False),
+                            use_coat_roughness=mat_info.get('use_coat_roughness', False),
+                            use_anisotropy=mat_info.get('use_anisotropy', False),
+                            use_occlusion=mat_info.get('use_occlusion', False),
+                            render=False
+                        )
+                    count += 1
+                except Exception as e:
+                    print(f"[{name}] 면 앞면 통일 처리 실패: {e}")
+
+        if count > 0:
+            self.sync_outliner_visibility()
+            log_action("ORIENT_FRONTFACES_SUCCESS", f"면 방향 통일 완료: {count}개 부품")
+            if not silent:
+                QMessageBox.information(
+                    self, "면 앞면 통일 완료", 
+                    f"전체 {count}개 부품 오브젝트의 모든 반전된 면(Backface)을 외부 앞면(Frontface) 방향으로 100% 자동 통일 정렬하였습니다.\n\n"
+                    f"이제 개별 부품을 체크/체크해제하거나 PBR 머티리얼을 적용해도 면 뚫림 현상 없이 표현됩니다."
+                )
 
     def on_btn_auto_fix(self):
-        """메시 자동 최적화 및 스무딩 다이얼로그 호출"""
+        """메시 자동 최적화 및 스무딩 다이얼로그 호출 (계층구조에서 체크된 오브젝트 대상)"""
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QCheckBox, QPushButton
         from PySide6.QtCore import Qt
         
@@ -1042,10 +3679,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "데이터 없음", "먼저 3D 모델을 불러와주세요.")
             return
 
+        checked_names = self.get_checked_item_names()
+        if not checked_names:
+            QMessageBox.information(self, "대상 없음", "계층구조(Outliner)에서 Auto-Fix를 적용할 오브젝트의 체크박스를 1개 이상 선택해 주세요.")
+            return
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Auto-Fix Mesh (형태 최적화)")
-        dialog.resize(400, 250)
+        dialog.resize(400, 260)
         layout = QVBoxLayout(dialog)
+        
+        # 0. 적용 대상 안내 라벨
+        lbl_target = QLabel(f"📌 적용 대상: 계층구조에서 체크된 {len(checked_names)}개 오브젝트")
+        lbl_target.setStyleSheet("font-weight: bold; color: #1E88E5; padding-bottom: 5px;")
+        layout.addWidget(lbl_target)
         
         # 1. Feature Angle (Edge split)
         layout_angle = QHBoxLayout()
@@ -1091,6 +3738,9 @@ class MainWindow(QMainWindow):
                 import numpy as np
                 import pyvista as pv
                 
+                # 실행 시점의 최신 체크 상태 반영
+                current_checked_names = self.get_checked_item_names()
+                
                 # 피킹된 면이 있는지 확인
                 has_picked = False
                 picked_centers = None
@@ -1106,10 +3756,12 @@ class MainWindow(QMainWindow):
                         picked_centers = self.picked_mesh.cell_centers().points
                         has_picked = True
                 
-                # 처리할 메시와 인덱스 수집
+                # 처리할 메시와 인덱스 수집 (체크 표시된 오브젝트로만 제한)
                 targets = {} # {name: cell_indices_to_process or None for all}
                 if has_picked:
                     for name, mesh in self.part_meshes.items():
+                        if name not in current_checked_names:
+                            continue
                         if mesh.n_cells == 0: continue
                         mesh_centers = mesh.cell_centers().points
                         matched_indices = []
@@ -1128,13 +3780,13 @@ class MainWindow(QMainWindow):
                         if matched_indices:
                             targets[name] = list(set(matched_indices))
                 else:
-                    # 선택된 면이 없으면 전체 메시를 대상으로 함
+                    # 선택된 면이 없으면 체크된 메시 전체를 대상으로 함
                     for name, mesh in self.part_meshes.items():
-                        if mesh.n_cells > 0:
+                        if name in current_checked_names and mesh.n_cells > 0:
                             targets[name] = None
                             
                 if not targets:
-                    QMessageBox.information(dialog, "선택 영역 없음", "처리할 유효한 폴리곤을 찾지 못했습니다.")
+                    QMessageBox.information(dialog, "선택 영역 없음", "체크된 오브젝트 중 처리할 유효한 폴리곤을 찾지 못했습니다.")
                     QApplication.restoreOverrideCursor()
                     return
 
@@ -1199,7 +3851,7 @@ class MainWindow(QMainWindow):
                         plotter.render()
                     
                 dialog.accept()
-                QMessageBox.information(self, "완료", "선택한(또는 전체) 형태 매시가 성공적으로 조정 및 최적화 되었습니다.")
+                QMessageBox.information(self, "완료", f"체크된 {len(targets)}개 오브젝트의 메쉬가 성공적으로 최적화 되었습니다.")
             except Exception as e:
                 QMessageBox.critical(self, "오류", f"최적화 중 오류가 발생했습니다:\n{e}")
             finally:
@@ -1248,16 +3900,30 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export 오류", f"오류 발생:\n{e}")
 
     def closeEvent(self, event):
-        if hasattr(self, 'viewport'):
-            for plotter in getattr(self.viewport, 'plotters', []):
-                try:
-                    plotter.close()
-                except Exception:
-                    pass
+        try:
+            if hasattr(self, 'viewport'):
+                for plotter in getattr(self.viewport, 'plotters', []):
+                    try:
+                        if hasattr(plotter, 'render_timer'):
+                            plotter.render_timer.stop()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         event.accept()
+        # 창 닫기(X) 시 백그라운드 VTK 스레드 잔여 및 Qt 루프 대기(Hang / 0xCFFFFFFF)를 원천 차단하고 즉시 정상 종료(0)
+        os._exit(0)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    activity_logger = install_activity_logger(app)
+    log_action("PROGRAM_START", "AI-NanoStudio 애플리케이션 시작")
+    if os.path.exists(ICON_PATH):
+        app.setWindowIcon(QIcon(ICON_PATH))
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    log_action("PROGRAM_EXIT", f"애플리케이션 정상 종료 (종료 코드: {exit_code})")
+    os._exit(exit_code)
+
+

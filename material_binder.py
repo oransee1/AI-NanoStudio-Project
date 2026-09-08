@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import trimesh
@@ -58,27 +59,43 @@ class MaterialBinder:
             print(f"Actor '{actor_name}'를 찾을 수 없습니다.")
             return False
 
-        prop = actor.prop
-        prop.interpolation = 'pbr'
-        prop.roughness = roughness_value
-        prop.metallic = metallic_value
+        try:
+            prop = actor.prop
+            try:
+                prop.interpolation = 'pbr'
+            except Exception:
+                pass
+            prop.roughness = roughness_value
+            prop.metallic = metallic_value
 
-        # 텍스처 로드 및 적용
-        if diffuse_path:
-            tex = pv.read_texture(diffuse_path)
-            actor.texture = tex
-            
-        # PyVista PBR 매핑
-        if normal_path:
-            prop.normal_texture = pv.read_texture(normal_path)
-        if roughness_path:
-            prop.roughness_texture = pv.read_texture(roughness_path)
-        if metallic_path:
-            prop.metallic_texture = pv.read_texture(metallic_path)
-            
-        plotter.render()
-        print(f"[Done] '{actor_name}'에 PBR 머티리얼 적용 완료")
-        return True
+            # 텍스처 로드 및 적용
+            if diffuse_path and os.path.exists(diffuse_path):
+                tex = pv.read_texture(diffuse_path)
+                actor.texture = tex
+                
+            # PyVista PBR 매핑
+            if normal_path and os.path.exists(normal_path):
+                try:
+                    prop.normal_texture = pv.read_texture(normal_path)
+                except Exception:
+                    pass
+            if roughness_path and os.path.exists(roughness_path):
+                try:
+                    prop.roughness_texture = pv.read_texture(roughness_path)
+                except Exception:
+                    pass
+            if metallic_path and os.path.exists(metallic_path):
+                try:
+                    prop.metallic_texture = pv.read_texture(metallic_path)
+                except Exception:
+                    pass
+                
+            plotter.render()
+            print(f"[Done] '{actor_name}'에 PBR 머티리얼 적용 완료")
+            return True
+        except Exception as e:
+            print(f"PBR 적용 오류: {e}")
+            return False
 
     @staticmethod
     def export_to_glb(mesh: trimesh.Trimesh, filepath="character_ready_to_play.glb"):

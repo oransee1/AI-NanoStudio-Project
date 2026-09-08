@@ -9,3 +9,6 @@ opencv-python
 google-genai
 python-dotenv
 rtree
+scipy
+OpenEXR
+
