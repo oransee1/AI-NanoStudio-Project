@@ -14,6 +14,7 @@ class ShadowBaker:
         for m in self.parts_dict.values():
             faces = m.faces.reshape(-1, 4)[:, 1:]
             tri_mesh = trimesh.Trimesh(vertices=m.points, faces=faces)
+            tri_mesh.fix_normals()
             combined_meshes.append(tri_mesh)
             
         full_scene = trimesh.util.concatenate(combined_meshes)

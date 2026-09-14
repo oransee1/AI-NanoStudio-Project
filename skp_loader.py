@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime
 import numpy as np
 import pyvista as pv
@@ -7,10 +8,18 @@ try:
 except ImportError:
     pass
 
-def load_skp_to_pyvista(skp_path):
+def load_skp_to_pyvista(skp_path, return_info=False, progress_callback=None):
     """
     openskp를 이용해 .skp 파일을 PyVista PolyData 액터 목록으로 변환합니다.
+    return_info=True 지정 시 (final_actors, parse_info) 튜플을 반환합니다.
     """
+    parse_info = {
+        "skp_version": "Unknown",
+        "layers": [],
+        "total_parts": 0,
+        "sample_parts": [],
+        "tag_counts": {}
+    }
     try:
         try:
             from openskp import legacy
@@ -38,57 +47,154 @@ def load_skp_to_pyvista(skp_path):
         except Exception:
             pass
 
-        model = SkpFile.open(skp_path).parse()
-        print(f"SketchUp 버전: {model.version}")
-        print(f"발견된 레이어: {[l.name for l in model.layers]}")
+        if progress_callback:
+            progress_callback(10, "SKP 파일 구조 읽기 및 객체 파싱 중...")
+
+        t_start = time.time()
+        skp_obj = SkpFile.open(skp_path)
+        model = skp_obj.parse()
+        version_str = str(getattr(model, 'version', 'Unknown'))
+        layers_list = [l.name for l in model.layers] if hasattr(model, 'layers') else []
+        print(f"[TIMER] parse() 소요시간: {time.time() - t_start:.3f}초", flush=True)
         
-        scene = SkpFile.open(skp_path).build_scene()
+        parse_info["skp_version"] = version_str
+        parse_info["layers"] = layers_list
+
+        if progress_callback:
+            progress_callback(20, "3D 씬 데이터 구성 및 바인딩 중...")
+
+        t_scene = time.time()
+        scene = skp_obj.build_scene()
+        print(f"[TIMER] build_scene() 소요시간: {time.time() - t_scene:.3f}초", flush=True)
         
-        actors = {}
-        
-        # mesh_index에서 의미 있는 이름 추출 및 동일 부품 병합
+        # 스케치업 모델의 Tags(레이어) 및 고유 RGB 색상 추출
+        layer_colors = {}
+        valid_layers = []
+        if hasattr(model, 'layers') and model.layers:
+            for l in model.layers:
+                l_name = getattr(l, 'name', 'Untagged')
+                r = getattr(l, 'color_r', 200) / 255.0
+                g = getattr(l, 'color_g', 200) / 255.0
+                b = getattr(l, 'color_b', 200) / 255.0
+                layer_colors[l_name] = [r, g, b]
+                if l_name and str(l_name).strip() not in ['Layer0', 'Untagged']:
+                    valid_layers.append(str(l_name).strip())
+
+        # mesh_index O(1) 사전 색인 매핑 구축 (파싱 속도 초고속화)
+        mesh_meta_map = {}
+        if hasattr(scene, 'mesh_index') and scene.mesh_index:
+            for k, meta in scene.mesh_index.items():
+                parts = k.split('_')
+                if len(parts) >= 2 and parts[0] == 'mesh' and parts[1].isdigit():
+                    m_idx = int(parts[1])
+                    if m_idx not in mesh_meta_map:
+                        mesh_meta_map[m_idx] = meta
+
         grouped_actors = {}
+        tag_group_counters = {}
         
+        t_loop = time.time()
+        total_prims = len(scene.glb_primitives)
         for i, prim in enumerate(scene.glb_primitives):
+            if progress_callback and total_prims > 0 and i % 50 == 0:
+                pct = 25 + int((i / total_prims) * 45) # 25% ~ 70%
+                progress_callback(pct, f"3D 메쉬 생성 및 레이어/그룹 추출 중... ({i}/{total_prims})")
+
             vertices = np.array(prim.positions, dtype=np.float32).reshape(-1, 3)
             indices = np.array(prim.indices, dtype=np.int32)
+            if len(vertices) == 0 or len(indices) == 0:
+                continue
+
             faces = np.column_stack([np.full(len(indices)//3, 3), indices.reshape(-1, 3)]).ravel()
             pv_mesh = pv.PolyData(vertices, faces)
             
-            # openskp에서 스케치업 파일 파싱 시 이미 미터(m) 또는 적절한 비율로 반환되므로 별도의 1000배 축소/확대가 필요하지 않습니다.
-            # 스케치업 원본 1 unit = 1m 스케일을 그대로 유지합니다.
-            
             # 스케치업 Z-up을 PyVista Y-up으로 보정
             pv_mesh.rotate_x(90, inplace=True)
+            try:
+                if "Normals" not in pv_mesh.point_data or pv_mesh.point_normals is None:
+                    pv_mesh.compute_normals(inplace=True)
+            except Exception:
+                pass
             
-            # 각진 모서리가 뭉개져(smudged) 보이는 현상을 방지하기 위해, 특정 각도(예: 45도) 이상의 날카로운 엣지는 면을 분리하여 하드 엣지로 렌더링
-            pv_mesh = pv_mesh.compute_normals(split_vertices=True, feature_angle=45)
-            
-            def_name = f"Layer_{i}"
-            if hasattr(scene, 'mesh_index') and scene.mesh_index:
-                # key 찾기
-                key = f"mesh_{i}"
-                for k in scene.mesh_index.keys():
-                    if k.startswith(key + "_"):
-                        meta = scene.mesh_index[k]
-                        if meta.definition_name:
-                            def_name = meta.definition_name
-                        break
-            
-            # 같은 컴포넌트(definition)끼리 병합
-            if def_name in grouped_actors:
-                grouped_actors[def_name] = grouped_actors[def_name].merge(pv_mesh)
-            else:
-                grouped_actors[def_name] = pv_mesh
+            tag_name = "Untagged"
+            sub_name = ""
+            meta = mesh_meta_map.get(i, None)
+            if meta:
+                l = getattr(meta, 'layer', None)
+                p = getattr(meta, 'path', None)
+                d = getattr(meta, 'definition_name', None)
+                n = getattr(meta, 'name', None)
                 
-        # 이름 유일성 보장 (만약 필요하다면)
+                l_str = str(l).strip() if l else ""
+                p_str = str(p).strip() if p else ""
+                d_str = str(d).strip() if d else ""
+                n_str = str(n).strip() if n else ""
+                
+                # 1. 실제 사용자가 지정한 스케치업 Tag(레이어)가 맵핑된 경우
+                if l_str and l_str not in ['Layer0', 'Untagged']:
+                    tag_name = l_str
+                # 2. path에서 스케치업 씬 상위 컴포넌트 파싱
+                elif p_str and '/' in p_str:
+                    path_parts = [pt.strip() for pt in p_str.split('/') if pt.strip()]
+                    if len(path_parts) >= 2 and path_parts[0] == 'ROOT':
+                        tag_name = path_parts[1]
+                    elif len(path_parts) >= 1:
+                        tag_name = path_parts[0]
+                # 3. definition_name 사용
+                elif d_str:
+                    tag_name = d_str
+                    
+                if n_str:
+                    sub_name = n_str
+                elif d_str:
+                    sub_name = d_str
+                elif p_str and '/' in p_str:
+                    path_parts = [pt.strip() for pt in p_str.split('/') if pt.strip()]
+                    sub_name = path_parts[-1]
+
+            if tag_name in ['Untagged', 'Layer0', 'ROOT_MODEL'] and valid_layers:
+                tag_name = valid_layers[i % len(valid_layers)]
+
+            if not sub_name:
+                sub_name = "Group"
+                
+            # 스케치업 개별 그룹(Group) 단위로 독립성을 보존하기 위한 유일 키 생성
+            counter_key = f"{tag_name}_{sub_name}"
+            tag_group_counters[counter_key] = tag_group_counters.get(counter_key, 0) + 1
+            idx = tag_group_counters[counter_key]
+            
+            full_key = f"{tag_name}/{sub_name}_{idx}"
+            
+            # 스케치업 Tag 고유 색상 및 태그명을 메시에 안전하게 보관 (VTK non-ASCII 에러 방지용 user_dict 적용)
+            tag_color = layer_colors.get(tag_name, [0.7, 0.7, 0.7])
+            if not hasattr(pv_mesh, 'user_dict') or pv_mesh.user_dict is None:
+                pv_mesh.user_dict = {}
+            pv_mesh.user_dict['tag_name'] = tag_name
+            pv_mesh.user_dict['tag_color'] = tag_color
+            
+            grouped_actors[full_key] = pv_mesh
+        print(f"[TIMER] glb_primitives 루프 소요시간: {time.time() - t_loop:.3f}초", flush=True)
+                
         final_actors = {}
         for name, mesh in grouped_actors.items():
             final_actors[name] = mesh
             
+        parse_info["total_parts"] = len(final_actors)
+        parse_info["sample_parts"] = list(final_actors.keys())[:10]
+        
+        tag_counts = {}
+        for k in final_actors.keys():
+            t = k.split('/')[0] if '/' in k else 'Untagged'
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+        parse_info["tag_counts"] = tag_counts
+
+        if return_info:
+            return final_actors, parse_info
         return final_actors
     except Exception as e:
         print(f"SKP 파싱 오류: {e}")
+        if return_info:
+            return {}, parse_info
         return {}
 
 def load_obj_to_pyvista(obj_path):
@@ -152,9 +258,9 @@ def export_meshes_to_obj(actors, output_path):
                 f.write(f"g {name}\n")        # Blender의 'Split By Group' 지원
                 f.write(f"usemtl {name}_mat\n") # 재질 그룹(Material) 지원
                 
-                # 법선(Normal) 계산이 안되어 있다면 계산
+                # 법선(Normal) 계산이 안되어 있다면 계산 (노멀 방향 자동 정렬 포함)
                 if not "Normals" in mesh.point_data:
-                    mesh = mesh.compute_normals(split_vertices=True, feature_angle=45)
+                    mesh = mesh.compute_normals(auto_orient_normals=True, split_vertices=True, feature_angle=45)
                 
                 points = mesh.points
                 normals = mesh.point_normals if "Normals" in mesh.point_data else None

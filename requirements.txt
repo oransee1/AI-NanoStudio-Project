@@ -11,4 +11,7 @@ python-dotenv
 rtree
 scipy
 OpenEXR
+reportlab
+streamlit
+Pillow
 

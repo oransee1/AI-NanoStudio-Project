@@ -25,6 +25,7 @@ class UVUnwrapper:
             # pv.PolyData를 trimesh.Trimesh로 변환 (PyVista 면 포맷: [3, v1,v2,v3, 3, v4,v5,v6])
             faces = pv_mesh.faces.reshape(-1, 4)[:, 1:]
             mesh = trimesh.Trimesh(vertices=pv_mesh.points, faces=faces)
+            mesh.fix_normals()
             self.atlas.add_mesh(mesh.vertices, mesh.faces)
             
         print("[xatlas] 병합 패킹 계산 중...")

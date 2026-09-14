@@ -233,7 +233,7 @@ class ViewportWidget(QWidget):
         
         # 버튼 이벤트
         self.btn_single.clicked.connect(lambda: (self.stacked_widget.setCurrentIndex(0), log_action("VIEW_LAYOUT_SWITCH", "시네마틱 뷰 (단일) 전환")))
-        self.btn_quad.clicked.connect(lambda: (self.stacked_widget.setCurrentIndex(1), log_action("VIEW_LAYOUT_SWITCH", "직교 뷰 (2x2) 전환")))
+        self.btn_quad.clicked.connect(lambda: (self.stacked_widget.setCurrentIndex(1), self.sync_quad_view(), log_action("VIEW_LAYOUT_SWITCH", "직교 뷰 (2x2) 전환")))
         
         self.plotters = [
             self.plotter_single,
@@ -266,6 +266,28 @@ class ViewportWidget(QWidget):
                     p.render()
         except Exception as e:
             print(f"렌더링 최적화 예외: {e}")
+
+    def sync_quad_view(self):
+        """단일 뷰에서 로드된 메시들을 직교 뷰(2x2) 플로터로 온디맨드 동기화"""
+        try:
+            main_win = self.window()
+            if hasattr(main_win, 'part_meshes') and main_win.part_meshes:
+                show_edges = getattr(self, 'show_edges', True)
+                quad_plotters = [self.plotter_tl, self.plotter_tr, self.plotter_bl, self.plotter_br]
+                for name, mesh in main_win.part_meshes.items():
+                    color = getattr(main_win, 'part_colors', {}).get(name, [0.8, 0.8, 0.8])
+                    for p in quad_plotters:
+                        if name not in p.actors:
+                            try:
+                                actor = p.add_mesh(mesh, name=name, color=color, show_edges=show_edges, render=False)
+                                if hasattr(actor, 'SetBackfaceProperty') and hasattr(actor, 'GetProperty'):
+                                    actor.SetBackfaceProperty(actor.GetProperty())
+                            except Exception:
+                                pass
+                self.setup_quad_cameras()
+                self.render_active()
+        except Exception as e:
+            print(f"Quad View 동기화 예외: {e}")
 
     def setup_viewport_aesthetics(self):
         """Maya 스타일의 옅은 회색 배경과 1m(1000유닛) 간격의 짙은 회색 바닥 그리드 생성"""
@@ -506,7 +528,7 @@ class ViewportWidget(QWidget):
             plotter.render()
         self.render_active()
 
-    def setup_pbr_lighting(self, plotter=None):
+    def setup_pbr_lighting(self, plotter=None, bounds=None):
         """Cinema View 및 메인 뷰포트 PBR 반사광/입체감 검수용 directional(방향성) 3점 조명 세팅 (모델 바운딩박스 스케일 동적 반영)"""
         target_plotters = [plotter] if plotter else self.plotters
         for p in target_plotters:
@@ -516,11 +538,11 @@ class ViewportWidget(QWidget):
                     p.renderer.SetTwoSidedLighting(True)
                 
                 # 모델 전체의 바운딩 박스 및 중심점/크기 계산 (구체 프리뷰 조명과 100% 동일한 비율 및 입체감 구현)
-                bounds = p.bounds  # (xmin, xmax, ymin, ymax, zmin, zmax)
-                cx = (bounds[0] + bounds[1]) / 2.0
-                cy = (bounds[2] + bounds[3]) / 2.0
-                cz = (bounds[4] + bounds[5]) / 2.0
-                diag = max(1.0, ((bounds[1]-bounds[0])**2 + (bounds[3]-bounds[2])**2 + (bounds[5]-bounds[4])**2)**0.5)
+                target_bounds = bounds if bounds is not None else p.bounds
+                cx = (target_bounds[0] + target_bounds[1]) / 2.0
+                cy = (target_bounds[2] + target_bounds[3]) / 2.0
+                cz = (target_bounds[4] + target_bounds[5]) / 2.0
+                diag = max(1.0, ((target_bounds[1]-target_bounds[0])**2 + (target_bounds[3]-target_bounds[2])**2 + (target_bounds[5]-target_bounds[4])**2)**0.5)
                 focal = (cx, cy, cz)
                 
                 # Directional Key Light (주 광원: 우측 사선 상단 정면)
@@ -542,36 +564,47 @@ class ViewportWidget(QWidget):
             except Exception as e:
                 print(f"조명 세팅 오류: {e}")
 
-    def reset_camera(self):
+    def reset_camera(self, bounds=None):
         """모든 뷰포트(시네마틱 및 4분할 직교 뷰)의 카메라를 현재 로드된 전체 메시에 맞게 리셋"""
         for plotter in self.plotters:
             try:
-                plotter.reset_camera()
+                if bounds is not None:
+                    plotter.reset_camera(bounds=bounds)
+                else:
+                    plotter.reset_camera()
+                if hasattr(plotter, 'renderer') and hasattr(plotter.renderer, 'ResetCameraClippingRange'):
+                    plotter.renderer.ResetCameraClippingRange()
             except Exception:
                 pass
         self.render_active()
 
-    def add_mesh_to_all(self, mesh, name=None, color=None):
-        """로드된 모델을 모든 플로터에 PBR 렌더링 속성으로 등록"""
-        show_edges = getattr(self, 'show_edges', True)
+    def add_mesh_to_all(self, mesh, name=None, color=None, reset_camera=False, update_mode=False, show_edges=False):
+        """로드된 모델을 활성 플로터에 PBR 렌더링 속성으로 등록 (초고속 배치 최적화)"""
         if not getattr(self, '_pbr_light_setup', False):
             self.setup_pbr_lighting()
             self._pbr_light_setup = True
 
-        for plotter in self.plotters:
+        # 단일 뷰 상태인 경우 plotter_single만 우선 등록하여 배치 연산량 80% 감축
+        if hasattr(self, 'stacked_widget') and self.stacked_widget.currentIndex() == 0:
+            target_plotters = [self.plotter_single]
+        else:
+            target_plotters = self.plotters
+
+        for plotter in target_plotters:
             try:
-                actor = plotter.add_mesh(mesh, name=name, color=color, pbr=True, roughness=0.5, metallic=0.0, show_edges=show_edges)
+                actor = plotter.add_mesh(mesh, name=name, color=color, show_edges=show_edges, reset_camera=reset_camera, render=False)
             except Exception:
-                actor = plotter.add_mesh(mesh, name=name, color=color, show_edges=show_edges)
+                actor = plotter.add_mesh(mesh, name=name, color=color, show_edges=show_edges, reset_camera=reset_camera, render=False)
             if hasattr(actor, 'SetBackfaceProperty') and hasattr(actor, 'GetProperty'):
                 try:
                     actor.SetBackfaceProperty(actor.GetProperty())
                 except Exception:
                     pass
-            plotter.show_axes()
-            plotter.reset_camera()
+            if reset_camera:
+                plotter.reset_camera()
             
-        self.set_display_render_mode(getattr(self, 'current_render_mode', 'material_preview'))
+        if update_mode:
+            self.set_display_render_mode(getattr(self, 'current_render_mode', 'material_preview'))
             
     def update_mesh(self, name, new_mesh, color):
         """기존 메시를 갱신하거나 새로 덮어씌움 (폴리곤 분할용)"""

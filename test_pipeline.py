@@ -134,6 +134,7 @@ def main():
     for i, (name, pv_mesh) in enumerate(actors.items()):
         faces = pv_mesh.faces.reshape(-1, 4)[:, 1:]
         tri_mesh = trimesh.Trimesh(vertices=pv_mesh.points, faces=faces)
+        tri_mesh.fix_normals()
         
         # xatlas에서 생성된 해당 파트의 uv 가져오기
         if i < len(atlas_list):

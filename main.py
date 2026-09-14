@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 import random
 import warnings
 import vtk
@@ -12,8 +13,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QTreeWidget, QTreeWidgetItem, QLabel, QTabWidget,
                                QDialog, QDoubleSpinBox, QSlider, QGroupBox, 
                                QFormLayout, QColorDialog, QLineEdit, QCheckBox, QScrollArea, QSizePolicy, QAbstractItemView,
-                               QMenu, QInputDialog, QFrame, QGridLayout)
-from PySide6.QtCore import Qt
+                               QMenu, QInputDialog, QFrame, QGridLayout, QTextEdit, QProgressDialog)
+from PySide6.QtCore import Qt, QEventLoop
 from PySide6.QtGui import QColor, QPixmap, QIcon
 import pyvista as pv
 from pyvistaqt import QtInteractor
@@ -39,6 +40,12 @@ from shadow_baker import ShadowBaker
 from genai_worker import GenAIWorker, MaterialAIWorker
 from material_binder import MaterialBinder
 from event_logger import get_logger, log_action, install_activity_logger
+from cinematic_director import CinematicDirector, VeoPromptWorker
+
+try:
+    from conti_pdf_builder import ContiPDFBuilder
+except ImportError:
+    ContiPDFBuilder = None
 
 # .env 파일 로드
 load_dotenv()
@@ -1831,6 +1838,74 @@ class RubberBandFilter(QObject):
                 return False
         return super().eventFilter(obj, event)
 
+class SkpLoadLogDialog(QDialog):
+    """스케치업 파일 파싱 및 로드 결과를 조금 큰 창에 정밀하게 보여주는 팝업 대화상자"""
+    def __init__(self, file_path, parse_info, log_text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📂 스케치업 파일 로드 리포트 (SketchUp Load Log)")
+        self.resize(650, 520)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        
+        # 1. 파일명 헤더
+        header_lbl = QLabel(f"<b>📁 스케치업 파일:</b> {os.path.basename(file_path)}")
+        header_lbl.setStyleSheet("font-size: 13px; color: #2C3E50;")
+        layout.addWidget(header_lbl)
+        
+        # 2. 요약 메타데이터 파싱 정보 그룹박스
+        summary_group = QGroupBox("📊 스케치업 파싱 정보 요약")
+        summary_layout = QVBoxLayout(summary_group)
+        
+        ver_str = parse_info.get('skp_version', 'Unknown')
+        layers_str = ", ".join(parse_info.get('layers', []))
+        total_cnt = parse_info.get('total_parts', 0)
+        
+        lbl_ver = QLabel(f"<b>• SketchUp 버전:</b> {ver_str}")
+        lbl_layers = QLabel(f"<b>• 발견된 레이어(Tags):</b> {layers_str}")
+        lbl_parts = QLabel(f"<b>• 총 감지된 독립 그룹/부품:</b> <font color='#27AE60'><b>{total_cnt}개</b></font>")
+        
+        summary_layout.addWidget(lbl_ver)
+        summary_layout.addWidget(lbl_layers)
+        summary_layout.addWidget(lbl_parts)
+        
+        tag_counts = parse_info.get('tag_counts', {})
+        if tag_counts:
+            dist_str = " | ".join([f"{t}: {c}개" for t, c in tag_counts.items()])
+            lbl_dist = QLabel(f"<b>• 레이어별 그룹 분포:</b> {dist_str}")
+            lbl_dist.setWordWrap(True)
+            summary_layout.addWidget(lbl_dist)
+            
+        layout.addWidget(summary_group)
+        
+        # 3. 상세 터미널 로그 뷰어
+        log_label = QLabel("<b>📝 스케치업 로딩 로그 상세 (Terminal Log):</b>")
+        layout.addWidget(log_label)
+        
+        self.txt_log = QTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setFontFamily("Consolas, Courier New, Monospace")
+        self.txt_log.setStyleSheet("background-color: #1E1E1E; color: #00FF66; font-size: 12px; border-radius: 4px; padding: 8px;")
+        self.txt_log.setText(log_text)
+        layout.addWidget(self.txt_log)
+        
+        # 4. 하단 버튼
+        btn_layout = QHBoxLayout()
+        btn_copy = QPushButton("📋 로그 복사 (Copy Log)")
+        btn_close = QPushButton("확인 (Close)")
+        btn_copy.clicked.connect(self.copy_log)
+        btn_close.clicked.connect(self.accept)
+        
+        btn_layout.addWidget(btn_copy)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
+        
+    def copy_log(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.txt_log.toPlainText())
+        QMessageBox.information(self, "복사 완료", "클립보드에 로딩 로그가 복사되었습니다.")
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1909,6 +1984,50 @@ class MainWindow(QMainWindow):
         self.btn_render_arch.setStyleSheet("font-weight: bold; color: white; background-color: #d84315; padding: 10px;")
         self.tab_arch_layout.addWidget(self.btn_render_arch)
         
+        # ── 시네마틱 디렉터 섹션 (FR-08, FR-09, FR-10) ──
+        self.tab_arch_layout.addWidget(QLabel(""))  # 간격
+        lbl_director = QLabel("🎬 시네마틱 디렉터 (Veo/Flow)")
+        lbl_director.setStyleSheet("font-weight: bold; font-size: 12px; color: #38bdf8;")
+        self.tab_arch_layout.addWidget(lbl_director)
+        
+        # 카메라 A/B 등록 버튼
+        cam_btn_layout = QHBoxLayout()
+        self.btn_set_cam_a = QPushButton("1️⃣ 시작점(A)")
+        self.btn_set_cam_b = QPushButton("2️⃣ 종료점(B)")
+        self.btn_set_cam_a.setToolTip("현재 뷰포트 카메라 앵글을 시작점(A)으로 등록합니다.")
+        self.btn_set_cam_b.setToolTip("현재 뷰포트 카메라 앵글을 종료점(B)으로 등록합니다.")
+        cam_btn_layout.addWidget(self.btn_set_cam_a)
+        cam_btn_layout.addWidget(self.btn_set_cam_b)
+        self.tab_arch_layout.addLayout(cam_btn_layout)
+        
+        # 카메라 등록 상태 표시
+        self.lbl_cam_status = QLabel("시작점(A): ⬜  |  종료점(B): ⬜")
+        self.lbl_cam_status.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        self.tab_arch_layout.addWidget(self.lbl_cam_status)
+        
+        # 씬 콘셉트 입력
+        self.input_scene_concept = QLineEdit()
+        self.input_scene_concept.setPlaceholderText("씬 콘셉트 (예: 일몰 황금빛 모던 콘크리트 빌라)")
+        self.tab_arch_layout.addWidget(self.input_scene_concept)
+        
+        # Veo 프롬프트 생성 & 콘티 PDF 추출 버튼
+        self.btn_generate_veo = QPushButton("🚀 Veo 모션 프롬프트 생성")
+        self.btn_generate_veo.setStyleSheet("font-weight: bold; color: white; background-color: #7c3aed; padding: 6px;")
+        self.btn_generate_veo.setToolTip("Gemini AI가 카메라 궤적을 분석하여 Google Flow/Veo 전용 프롬프트를 자동 생성합니다.")
+        self.tab_arch_layout.addWidget(self.btn_generate_veo)
+        
+        self.btn_export_conti = QPushButton("📄 콘티 PDF + 프레임 일괄 추출")
+        self.btn_export_conti.setStyleSheet("font-weight: bold; color: white; background-color: #0284c7; padding: 6px;")
+        self.btn_export_conti.setToolTip("First/Last Frame PNG, 모션 프롬프트, 콘티 기획서 PDF를 한 번에 추출합니다.")
+        self.tab_arch_layout.addWidget(self.btn_export_conti)
+        
+        # Veo 프롬프트 결과 표시
+        self.lbl_veo_result = QLabel("")
+        self.lbl_veo_result.setWordWrap(True)
+        self.lbl_veo_result.setStyleSheet("font-size: 10px; color: #e2e8f0; background-color: #1e1b2e; border: 1px solid #332b4a; border-radius: 4px; padding: 4px;")
+        self.lbl_veo_result.setMinimumHeight(40)
+        self.tab_arch_layout.addWidget(self.lbl_veo_result)
+        
         self.tab_arch_layout.addStretch()
         if not tab_icon.isNull():
             self.tabs.addTab(self.tab_arch, tab_icon, "Part 1: 렌더링")
@@ -1928,6 +2047,10 @@ class MainWindow(QMainWindow):
         self.tab_game_layout.addWidget(self.btn_generate_hdri)
         self.btn_apply_pbr = QPushButton("PBR 머터리얼 적용 (선택 부품)")
         self.tab_game_layout.addWidget(self.btn_apply_pbr)
+        self.btn_export_glb = QPushButton("🎮 GLB 게임 에셋 내보내기")
+        self.btn_export_glb.setStyleSheet("font-weight: bold; color: white; background-color: #16a34a; padding: 8px;")
+        self.btn_export_glb.setToolTip("현재 모델을 텍스처 내장형 .glb 파일로 내보냅니다 (Unity/Unreal 즉시 호환).")
+        self.tab_game_layout.addWidget(self.btn_export_glb)
         self.tab_game_layout.addStretch()
         if not tab_icon.isNull():
             self.tabs.addTab(self.tab_game, tab_icon, "Part 2: 게임 에셋")
@@ -2015,6 +2138,7 @@ class MainWindow(QMainWindow):
         
         # 매니저 및 데이터 초기화
         self.camera_manager = CameraManager(self.viewport.plotter_single)
+        self.cinematic_director = CinematicDirector()
         self.uv_unwrapper = UVUnwrapper()
         self.loaded_actors = {}
         self.atlas = None
@@ -2035,6 +2159,13 @@ class MainWindow(QMainWindow):
         self.btn_load_hdri.clicked.connect(self.on_load_hdri)
         self.btn_generate_hdri.clicked.connect(self.on_generate_hdri)
         self.btn_apply_pbr.clicked.connect(self.on_apply_pbr)
+        self.btn_export_glb.clicked.connect(self.on_export_glb)
+        
+        # 시네마틱 디렉터 이벤트 연결 (FR-08, FR-09, FR-10)
+        self.btn_set_cam_a.clicked.connect(lambda: self.on_set_camera_keyframe('A'))
+        self.btn_set_cam_b.clicked.connect(lambda: self.on_set_camera_keyframe('B'))
+        self.btn_generate_veo.clicked.connect(self.on_generate_veo_prompt)
+        self.btn_export_conti.clicked.connect(self.on_export_conti_pdf)
         
         self.btn_pick_p.clicked.connect(self.on_btn_pick_p)
         self.btn_pick_r.clicked.connect(self.on_btn_pick_r)
@@ -2050,18 +2181,117 @@ class MainWindow(QMainWindow):
     def on_display_mode_changed(self, index):
         show_edges = (index == 0) # 0: 폴리곤, 1: 솔리드
         self.viewport.set_display_mode(show_edges)
-        
+
     def load_skp_file(self, file_path):
         log_action("LOAD_SKP_START", f"파일 경로: {file_path}")
-        actors = load_skp_to_pyvista(file_path)
+        start_time = time.time()
+        
+        # 프로그레스 대화상자 생성 (UI 멈춤/Hang 방지 및 실시간 파싱 진행률 표시)
+        progress = None
+        try:
+            progress = QProgressDialog("SKP 3D 모델 데이터 파싱 및 파이프라인 구성 중...", None, 0, 100, self)
+            progress.setWindowTitle("SKP 파일 로딩 중")
+            progress.setWindowModality(Qt.NonModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(5)
+            progress.show()
+            QApplication.processEvents()
+        except Exception:
+            pass
+        
+        def update_progress(val, text=""):
+            elapsed_sec = time.time() - start_time
+            time_str = f" [소요시간: {elapsed_sec:.1f}초]"
+            if progress:
+                try:
+                    progress.setValue(val)
+                    if text:
+                        progress.setLabelText(f"{text}{time_str}")
+                    else:
+                        progress.setLabelText(f"SKP 3D 데이터 처리 중...{time_str}")
+                    progress.repaint()
+                except Exception:
+                    pass
+            
+        update_progress(10, "openskp 데이터 구조 파싱 시작...")
+        
+        # openskp 파싱 및 상세 정보 수집
+        actors, parse_info = load_skp_to_pyvista(file_path, return_info=True, progress_callback=update_progress)
+        
         if not actors:
+            if progress:
+                try:
+                    progress.close()
+                except Exception:
+                    pass
             log_action("LOAD_SKP_FAIL", f"로드 실패: {file_path}")
             QMessageBox.warning(self, "Load Error", "SKP 파일을 로드하지 못했습니다. openskp 설치 상태를 확인하세요.")
             return
-        log_action("LOAD_SKP_SUCCESS", f"로드 완료 | 총 {len(actors)}개 부품 감지: {list(actors.keys())[:5]}...")
+            
+        sample_keys = list(actors.keys())[:5]
+        log_action("LOAD_SKP_SUCCESS", f"로드 완료 | 총 {len(actors)}개 부품 감지: {sample_keys}...")
         self.loaded_actors = actors
-        self.populate_scene(actors)
+        
+        update_progress(75, f"뷰포트 3D 씬 및 아웃라이너 배치 중... (총 {len(actors)}개 부품)")
+        self.populate_scene(actors, progress_callback=update_progress)
+        
+        update_progress(100, "로딩 완료! 3D 뷰포트 화면 갱신 중...")
+        if progress:
+            try:
+                progress.setValue(100)
+                progress.close()
+                progress.deleteLater()
+            except Exception:
+                pass
+        QApplication.processEvents()
+        
         self.update_window_title(file_path)
+        
+        # 뷰포트 카메라 및 3D 화면 즉시 강제 렌더링
+        if hasattr(self, 'part_meshes') and self.part_meshes:
+            overall_b = [float('inf'), float('-inf'), float('inf'), float('-inf'), float('inf'), float('-inf')]
+            for _, m in self.part_meshes.items():
+                if m and m.n_points > 0:
+                    b = m.bounds
+                    overall_b[0] = min(overall_b[0], b[0])
+                    overall_b[1] = max(overall_b[1], b[1])
+                    overall_b[2] = min(overall_b[2], b[2])
+                    overall_b[3] = max(overall_b[3], b[3])
+                    overall_b[4] = min(overall_b[4], b[4])
+                    overall_b[5] = max(overall_b[5], b[5])
+            if overall_b[0] != float('inf'):
+                self.viewport.reset_camera(bounds=overall_b)
+            else:
+                self.viewport.reset_camera()
+        else:
+            self.viewport.reset_camera()
+            
+        self.viewport.render_active()
+        QApplication.processEvents()
+        
+        # 로그 대화상자에 표시할 상세 텍스트 빌드
+        from datetime import datetime as dt
+        now_str = dt.now().strftime("%H:%M:%S.%f")[:-3]
+        
+        log_text = (
+            f"SketchUp 버전: {{{parse_info.get('skp_version', 'Unknown')}}}\n"
+            f"발견된 레이어: {parse_info.get('layers', [])}\n"
+            f"[{now_str}] [INFO] [ACTION] LOAD_SKP_SUCCESS | 로드 완료 | 총 {len(actors)}개 부품 감지: {sample_keys}...\n\n"
+            f"=== 레이어별 세부 그룹 수 분포 ===\n"
+        )
+        for tag, count in parse_info.get('tag_counts', {}).items():
+            log_text += f"  • {tag}: {count} Groups\n"
+            
+        log_text += f"\n=== 로드된 샘플 부품 명칭 리스트 (상위 30개) ===\n"
+        for name in list(actors.keys())[:30]:
+            log_text += f"  - {name}\n"
+        if len(actors) > 30:
+            log_text += f"  ... 외 {len(actors) - 30}개 부품 추가 로드 완료\n"
+            
+        # 로드 로그 대화상자 표시 (비모달 show로 메인 뷰포트 3D 렌더링 차단 해제)
+        if self.isVisible():
+            self.load_log_dlg = SkpLoadLogDialog(file_path, parse_info, log_text, self)
+            self.load_log_dlg.show()
         
     def on_load_skp(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Open SketchUp File", "", "SketchUp Files (*.skp)")
@@ -2113,9 +2343,16 @@ class MainWindow(QMainWindow):
             self.viewport.plotter_single.add_text(dim_text, position=(0.02, 0.92), font_size=5, viewport=True, color="#222222", name="dimensions")
             self.viewport.plotter_single.render()
 
-    def populate_scene(self, actors_dict):
-        """불러온 데이터를 화면과 아웃라이너에 세팅"""
+    def populate_scene(self, actors_dict, progress_callback=None):
+        """불러온 데이터를 화면과 아웃라이너에 세팅 (고속 최적화 적용)"""
+        self.tree_widget.blockSignals(True)
+        self.tree_widget.setUpdatesEnabled(False)
         self.tree_widget.clear()
+        
+        # 뷰포트 rendering 및 업데이트 억제 (배치 속도 극대화 & 응답 없음 방지)
+        for p in self.viewport.plotters:
+            p.suppress_rendering = True
+        self.viewport.setUpdatesEnabled(False)
         
         # 랜덤 색상 생성용 헬퍼 함수
         def random_color():
@@ -2130,20 +2367,20 @@ class MainWindow(QMainWindow):
         self.frontface_locked_parts = set()
         self.part_meshes = actors_dict
         
-        # 스케치업/CAD 모델 로드 시 매끄러운 모서리 법선(Normal) 정렬 및 외부 앞면 통일
-        for name, mesh in list(self.part_meshes.items()):
-            if mesh and getattr(mesh, 'n_cells', 0) > 0:
-                try:
-                    oriented = self.ensure_frontfaces_oriented(mesh)
-                    self.part_meshes[name] = oriented
-                except Exception:
-                    pass
-        
         # 전체 바운딩 박스 크기 계산 (치수 정보 표시용)
         overall_bounds = [float('inf'), float('-inf'), float('inf'), float('-inf'), float('inf'), float('-inf')]
         
-        # 각 메시 추가
-        for name, mesh in actors_dict.items():
+        # 스케치업 Tags(레이어) 부모 노드 추적용 및 아이콘 캐시
+        tag_items = {}
+        icon_cache = {}
+        
+        total_parts = len(actors_dict)
+        # 각 메시 추가 및 Tags(레이어) 계층구조 생성
+        for idx_count, (name, mesh) in enumerate(actors_dict.items()):
+            if progress_callback and total_parts > 0 and idx_count % 100 == 0:
+                pct = 75 + int((idx_count / total_parts) * 20) # 75% ~ 95%
+                progress_callback(pct, f"3D 메쉬 및 트리 노드 구성 중... ({idx_count}/{total_parts})")
+
             b = mesh.bounds
             overall_bounds[0] = min(overall_bounds[0], b[0])
             overall_bounds[1] = max(overall_bounds[1], b[1])
@@ -2152,25 +2389,80 @@ class MainWindow(QMainWindow):
             overall_bounds[4] = min(overall_bounds[4], b[4])
             overall_bounds[5] = max(overall_bounds[5], b[5])
             
-            # 아웃라이너(트리)에 항목 추가
-            item = QTreeWidgetItem(self.tree_widget, [name])
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
-            item.setCheckState(0, Qt.Checked)
-            item.setData(0, Qt.UserRole, name)
-            
-            # 각 부품별로 구분되는 색상 부여
-            part_color = random_color()
+            # 스케치업 Tag 색상 추출 또는 색상 생성 (user_dict 안전 지원)
+            if hasattr(mesh, 'user_dict') and mesh.user_dict and 'tag_color' in mesh.user_dict:
+                tag_col_arr = mesh.user_dict['tag_color']
+                part_color = [float(tag_col_arr[0]), float(tag_col_arr[1]), float(tag_col_arr[2])]
+            elif hasattr(mesh, 'field_data') and 'tag_color' in mesh.field_data:
+                tag_col_arr = mesh.field_data['tag_color']
+                part_color = [float(tag_col_arr[0]), float(tag_col_arr[1]), float(tag_col_arr[2])]
+            else:
+                part_color = random_color()
             self.part_colors[name] = part_color
             
-            # 아이콘 생성 (QPixmap 사용)
-            pixmap = QPixmap(16, 16)
-            qcolor = QColor(int(part_color[0]*255), int(part_color[1]*255), int(part_color[2]*255))
-            pixmap.fill(qcolor)
-            item.setIcon(0, QIcon(pixmap))
+            # 픽스맵 아이콘 생성 및 캐싱
+            rgb_key = (int(part_color[0]*255), int(part_color[1]*255), int(part_color[2]*255))
+            if rgb_key not in icon_cache:
+                pixmap = QPixmap(16, 16)
+                pixmap.fill(QColor(*rgb_key))
+                icon_cache[rgb_key] = QIcon(pixmap)
+            icon = icon_cache[rgb_key]
+            
+            # 이름에서 Tag(레이어)와 서브부품 분리 (예: "기초부/기둥")
+            if "/" in name:
+                tag_name, sub_name = name.split("/", 1)
+                
+                # 부모 Tag 노드가 없으면 생성 (스케치업 Tags 패널 항목)
+                if tag_name not in tag_items:
+                    parent_item = QTreeWidgetItem(self.tree_widget, [tag_name])
+                    parent_item.setFlags(parent_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                    parent_item.setCheckState(0, Qt.Checked)
+                    parent_item.setData(0, Qt.UserRole, tag_name)
+                    parent_item.setIcon(0, icon)
+                    tag_items[tag_name] = parent_item
+                else:
+                    parent_item = tag_items[tag_name]
+                    
+                # 자식 부품 노드 추가
+                item = QTreeWidgetItem(parent_item, [sub_name])
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                item.setCheckState(0, Qt.Checked)
+                item.setData(0, Qt.UserRole, name)
+                item.setIcon(0, icon)
+            else:
+                item = QTreeWidgetItem(self.tree_widget, [name])
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                item.setCheckState(0, Qt.Checked)
+                item.setData(0, Qt.UserRole, name)
+                item.setIcon(0, icon)
             
             self.viewport.add_mesh_to_all(mesh, name=name, color=part_color)
 
+        # 각 Tag(레이어) 부모 노드 텍스트에 그룹 개수(예: "기주부 (11 Groups)") 업데이트
+        for tag_name, parent_item in tag_items.items():
+            child_cnt = parent_item.childCount()
+            if child_cnt > 0:
+                parent_item.setText(0, f"{tag_name} ({child_cnt} Groups)")
+
+        self.tree_widget.expandAll()
         self.update_dimensions_text()
+        
+        # 뷰포트 rendering 억제 해제 및 카메라 리셋
+        for p in self.viewport.plotters:
+            p.suppress_rendering = False
+        self.viewport.setUpdatesEnabled(True)
+        
+        if overall_bounds[0] != float('inf'):
+            self.viewport.setup_pbr_lighting(bounds=overall_bounds)
+            self.viewport.reset_camera(bounds=overall_bounds)
+        else:
+            self.viewport.reset_camera()
+
+        self.viewport.set_display_render_mode(getattr(self.viewport, 'current_render_mode', 'material_preview'))
+        self.viewport.render_active()
+        
+        self.tree_widget.setUpdatesEnabled(True)
+        self.tree_widget.blockSignals(False)
             
         # UI 업데이트
         self.btn_ai_texture.setEnabled(True)
@@ -3861,6 +4153,227 @@ class MainWindow(QMainWindow):
         btn_cancel.clicked.connect(dialog.reject)
         
         dialog.exec()
+
+    # ── 시네마틱 디렉터 핸들러 (FR-08, FR-09, FR-10) ──────────────────
+
+    def on_set_camera_keyframe(self, slot):
+        """FR-08: 현재 뷰포트 카메라 앵글을 시작점(A) 또는 종료점(B)으로 등록"""
+        try:
+            plotter = self.viewport.plotter_single
+            pose = self.cinematic_director.set_keyframe(slot, plotter)
+            self.lbl_cam_status.setText(self.cinematic_director.get_registration_status())
+            
+            pos = pose["position"]
+            slot_name = "시작점(A)" if slot == 'A' else "종료점(B)"
+            QMessageBox.information(
+                self, "카메라 등록 완료",
+                f"{slot_name} 카메라 앵글이 등록되었습니다.\n"
+                f"위치: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+            )
+            log_action("CAMERA_KEYFRAME", f"{slot_name} 등록: {pos}")
+        except Exception as e:
+            QMessageBox.warning(self, "오류", f"카메라 등록 중 오류 발생:\n{e}")
+
+    def on_generate_veo_prompt(self):
+        """FR-09: Gemini Cinematic Director Agent를 호출하여 Veo 모션 프롬프트 생성"""
+        if not GEMINI_API_KEY:
+            QMessageBox.warning(self, "API Key", ".env 파일에 GEMINI_API_KEY가 설정되어 있지 않습니다.")
+            return
+            
+        if not self.cinematic_director.has_both_keyframes():
+            QMessageBox.warning(self, "카메라 미등록", "시작점(A)과 종료점(B)을 모두 먼저 등록해주세요.")
+            return
+        
+        try:
+            motion_vector = self.cinematic_director.compute_motion_vector()
+            scene_desc = self.input_scene_concept.text().strip()
+            if not scene_desc:
+                scene_desc = "Modern architectural building with clean geometric forms"
+            
+            # 한글 요약 먼저 표시
+            summary = self.cinematic_director.get_summary_text()
+            self.lbl_veo_result.setText(f"분석 중... {summary}")
+            
+            # Gemini 비동기 워커 호출
+            self._veo_worker = VeoPromptWorker(
+                start_cam=self.cinematic_director.keyframe_a,
+                end_cam=self.cinematic_director.keyframe_b,
+                motion_vector=motion_vector,
+                scene_desc=scene_desc,
+                api_key=GEMINI_API_KEY,
+            )
+            self._veo_worker.prompt_ready.connect(self._on_veo_prompt_ready)
+            self._veo_worker.error.connect(self._on_veo_error)
+            self._veo_worker.start()
+            
+            self.btn_generate_veo.setEnabled(False)
+            log_action("VEO_PROMPT_REQUEST", f"씬: {scene_desc}")
+        except Exception as e:
+            QMessageBox.warning(self, "오류", f"프롬프트 생성 요청 중 오류:\n{e}")
+
+    def _on_veo_prompt_ready(self, prompt_text):
+        """Veo 프롬프트 생성 완료 시 호출"""
+        self.btn_generate_veo.setEnabled(True)
+        self._last_veo_prompt = prompt_text
+        
+        summary = self.cinematic_director.get_summary_text()
+        self.lbl_veo_result.setText(f"✅ {summary}\n\n📝 Veo Prompt:\n{prompt_text}")
+        log_action("VEO_PROMPT_READY", prompt_text[:100])
+        
+        QMessageBox.information(
+            self, "Veo 프롬프트 생성 완료",
+            f"Cinematic Director Agent가 모션 프롬프트를 생성했습니다.\n\n{prompt_text[:200]}..."
+            if len(prompt_text) > 200 else
+            f"Cinematic Director Agent가 모션 프롬프트를 생성했습니다.\n\n{prompt_text}"
+        )
+
+    def _on_veo_error(self, err_msg):
+        """Veo 프롬프트 생성 실패 시 호출"""
+        self.btn_generate_veo.setEnabled(True)
+        self.lbl_veo_result.setText(f"❌ 오류: {err_msg}")
+        QMessageBox.warning(self, "Director Agent 오류", err_msg)
+
+    def on_export_conti_pdf(self):
+        """FR-10: First/Last Frame PNG + 모션 프롬프트 + 콘티 PDF 일괄 추출"""
+        if not self.cinematic_director.has_both_keyframes():
+            QMessageBox.warning(self, "카메라 미등록", "시작점(A)과 종료점(B)을 모두 먼저 등록해주세요.")
+            return
+        
+        try:
+            from datetime import datetime as dt
+            
+            # 출력 디렉토리 설정
+            today_str = dt.now().strftime("%Y-%m-%d")
+            output_dir = os.path.join(BASE_DIR, "Output", today_str, "Cinematic")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 1. First/Last Frame 캡처
+            plotter = self.viewport.plotter_single
+            start_path, end_path = self.cinematic_director.capture_frames(plotter, output_dir)
+            
+            # 2. 카메라 데이터 수집
+            camera_data = self.cinematic_director.get_camera_data_for_pdf()
+            
+            # 3. 씬 콘셉트 및 프롬프트
+            scene_desc = self.input_scene_concept.text().strip() or "Architectural Scene"
+            motion_prompt = getattr(self, '_last_veo_prompt', '(Veo 프롬프트를 먼저 생성해주세요)')
+            
+            # 4. 프롬프트 텍스트 파일 저장
+            timestamp = dt.now().strftime("%H%M%S")
+            prompt_txt_path = os.path.join(output_dir, f"motion_prompt_{timestamp}.txt")
+            with open(prompt_txt_path, 'w', encoding='utf-8') as f:
+                f.write(f"Scene Concept: {scene_desc}\n\n")
+                f.write(f"Veo Motion Prompt:\n{motion_prompt}\n\n")
+                f.write(f"Camera Data:\n{camera_data}\n")
+            
+            # 5. 콘티 PDF 생성
+            pdf_path = os.path.join(output_dir, f"cinematic_sheet_{timestamp}.pdf")
+            if ContiPDFBuilder is not None:
+                ContiPDFBuilder.build(
+                    start_img_path=start_path,
+                    end_img_path=end_path,
+                    motion_prompt=motion_prompt,
+                    scene_desc=scene_desc,
+                    camera_data=camera_data,
+                    output_path=pdf_path,
+                )
+                pdf_msg = f"• 콘티 PDF: {os.path.basename(pdf_path)}"
+            else:
+                pdf_msg = "• 콘티 PDF: reportlab 미설치로 스킵됨"
+            
+            QMessageBox.information(
+                self, "콘티 일괄 추출 완료",
+                f"시네마틱 에셋이 추출되었습니다!\n\n"
+                f"• 시작 프레임: {os.path.basename(start_path)}\n"
+                f"• 종료 프레임: {os.path.basename(end_path)}\n"
+                f"• 프롬프트: {os.path.basename(prompt_txt_path)}\n"
+                f"{pdf_msg}\n\n"
+                f"저장 경로: {output_dir}"
+            )
+            log_action("CONTI_EXPORT", f"경로: {output_dir}")
+        except Exception as e:
+            QMessageBox.warning(self, "콘티 추출 오류", f"추출 중 오류 발생:\n{e}")
+
+    # ── GLB 게임 에셋 익스포트 핸들러 (FR-11) ──────────────────────
+
+    def on_export_glb(self):
+        """FR-11: 현재 로드된 모델을 텍스처 내장형 .glb 파일로 내보내기"""
+        if not hasattr(self, 'part_meshes') or not self.part_meshes:
+            QMessageBox.warning(self, "Export Error", "내보낼 모델이 없습니다. 먼저 모델을 로드하세요.")
+            return
+        
+        try:
+            import trimesh
+            from datetime import datetime as dt
+            
+            # 저장 경로 설정
+            today_str = dt.now().strftime("%Y-%m-%d")
+            default_dir = os.path.join(BASE_DIR, "Output", "GameObject", today_str)
+            os.makedirs(default_dir, exist_ok=True)
+            default_path = os.path.join(default_dir, "game_asset.glb")
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "GLB 파일 내보내기", default_path, "GLB Files (*.glb)"
+            )
+            if not file_path:
+                return
+            
+            # 각 파트를 trimesh로 변환하여 Scene에 추가
+            tri_meshes = []
+            for name, pv_mesh in self.part_meshes.items():
+                try:
+                    faces_raw = pv_mesh.faces
+                    if len(faces_raw) == 0:
+                        continue
+                    faces = faces_raw.reshape(-1, 4)[:, 1:]
+                    tri_mesh = trimesh.Trimesh(vertices=pv_mesh.points, faces=faces)
+                    tri_mesh.fix_normals()
+                    
+                    # UV가 있으면 바인딩
+                    if pv_mesh.active_texture_coordinates is not None:
+                        tri_mesh.visual = trimesh.visual.TextureVisuals(
+                            uv=pv_mesh.active_texture_coordinates
+                        )
+                    
+                    tri_meshes.append(tri_mesh)
+                except Exception as mesh_err:
+                    print(f"[GLB] '{name}' 변환 스킵: {mesh_err}")
+                    continue
+            
+            if not tri_meshes:
+                QMessageBox.warning(self, "Export Error", "변환 가능한 메시가 없습니다.")
+                return
+            
+            # 텍스처 바인딩 (최종 디퓨즈가 존재하면)
+            final_diffuse = os.path.join(BASE_DIR, "final_clothed_diffuse.png")
+            if os.path.exists(final_diffuse):
+                try:
+                    import cv2
+                    diffuse_img = cv2.imread(final_diffuse)
+                    if diffuse_img is not None:
+                        diffuse_rgb = cv2.cvtColor(diffuse_img, cv2.COLOR_BGR2RGB)
+                        material = trimesh.visual.texture.SimpleMaterial(image=diffuse_rgb)
+                        for tm in tri_meshes:
+                            if hasattr(tm.visual, 'uv') and tm.visual.uv is not None:
+                                tm.visual = trimesh.visual.TextureVisuals(
+                                    uv=tm.visual.uv, material=material
+                                )
+                except Exception as tex_err:
+                    print(f"[GLB] 텍스처 바인딩 실패 (무시): {tex_err}")
+            
+            # 씬 조합 및 내보내기
+            scene = trimesh.Scene(tri_meshes)
+            scene.export(file_path)
+            
+            QMessageBox.information(
+                self, "GLB Export 완료",
+                f"게임 엔진용 GLB 파일이 저장되었습니다!\n\n"
+                f"파일: {file_path}\n"
+                f"부품 수: {len(tri_meshes)}개"
+            )
+            log_action("GLB_EXPORT", f"경로: {file_path}, 부품: {len(tri_meshes)}")
+        except Exception as e:
+            QMessageBox.critical(self, "GLB Export 오류", f"오류 발생:\n{e}")
 
     def on_export_obj(self):
         if not hasattr(self, 'part_meshes') or not self.part_meshes:

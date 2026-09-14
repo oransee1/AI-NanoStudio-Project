@@ -100,6 +100,10 @@ class MaterialBinder:
     @staticmethod
     def export_to_glb(mesh: trimesh.Trimesh, filepath="character_ready_to_play.glb"):
         """게임 엔진용 GLB 파일로 내보냅니다."""
+        try:
+            mesh.fix_normals()
+        except Exception as e:
+            print(f"GLB 노멀 자동 보정 경고: {e}")
         mesh.export(filepath)
         print(f"[Done] 게임 엔진용 파일 저장 완료: {filepath}")
         return filepath

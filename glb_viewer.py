@@ -124,20 +124,40 @@ class GLBViewerApp(QMainWindow):
             self.tree_widget.blockSignals(True)
             
             if isinstance(scene, pv.MultiBlock):
+                tag_items = {}
                 for i in range(scene.n_blocks):
                     block_name = scene.keys()[i] if scene.keys() else f"Part_{i}"
                     sub_mesh = scene[i]
                     if sub_mesh is None:
                         continue
                     
-                    item = QTreeWidgetItem(self.tree_widget)
-                    item.setText(0, block_name)
-                    item.setText(1, type(sub_mesh).__name__)
-                    item.setData(0, Qt.UserRole, block_name)
-                    item.setCheckState(0, Qt.Checked)
+                    if "/" in block_name:
+                        tag_name, sub_name = block_name.split("/", 1)
+                        if tag_name not in tag_items:
+                            parent_item = QTreeWidgetItem(self.tree_widget)
+                            parent_item.setText(0, tag_name)
+                            parent_item.setText(1, "Tag/Layer")
+                            parent_item.setData(0, Qt.UserRole, tag_name)
+                            parent_item.setCheckState(0, Qt.Checked)
+                            tag_items[tag_name] = parent_item
+                        else:
+                            parent_item = tag_items[tag_name]
+                            
+                        item = QTreeWidgetItem(parent_item)
+                        item.setText(0, sub_name)
+                        item.setText(1, type(sub_mesh).__name__)
+                        item.setData(0, Qt.UserRole, block_name)
+                        item.setCheckState(0, Qt.Checked)
+                    else:
+                        item = QTreeWidgetItem(self.tree_widget)
+                        item.setText(0, block_name)
+                        item.setText(1, type(sub_mesh).__name__)
+                        item.setData(0, Qt.UserRole, block_name)
+                        item.setCheckState(0, Qt.Checked)
                     
                     actor = self.plotter.add_mesh(sub_mesh, name=block_name, show_edges=False)
                     self.actors[block_name] = actor
+                self.tree_widget.expandAll()
             else:
                 item = QTreeWidgetItem(self.tree_widget)
                 name = "Merged_Car"
