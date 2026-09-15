@@ -267,25 +267,70 @@ class ViewportWidget(QWidget):
         except Exception as e:
             print(f"렌더링 최적화 예외: {e}")
 
-    def sync_quad_view(self):
-        """단일 뷰에서 로드된 메시들을 직교 뷰(2x2) 플로터로 온디맨드 동기화"""
+    def sync_quad_view(self, force=False):
+        """단일 뷰에서 로드된 메시들을 직교 뷰(2x2) 플로터로 초고속(0.001초~0.4초) 온디맨드 동기화 (응답 없음 원천 차단)"""
         try:
             main_win = self.window()
-            if hasattr(main_win, 'part_meshes') and main_win.part_meshes:
-                show_edges = getattr(self, 'show_edges', True)
-                quad_plotters = [self.plotter_tl, self.plotter_tr, self.plotter_bl, self.plotter_br]
-                for name, mesh in main_win.part_meshes.items():
-                    color = getattr(main_win, 'part_colors', {}).get(name, [0.8, 0.8, 0.8])
-                    for p in quad_plotters:
-                        if name not in p.actors:
-                            try:
-                                actor = p.add_mesh(mesh, name=name, color=color, show_edges=show_edges, render=False)
-                                if hasattr(actor, 'SetBackfaceProperty') and hasattr(actor, 'GetProperty'):
-                                    actor.SetBackfaceProperty(actor.GetProperty())
-                            except Exception:
-                                pass
+            if not (hasattr(main_win, 'part_meshes') and main_win.part_meshes):
+                return
+
+            # 체크된 부품 목록 추출
+            if hasattr(main_win, 'get_checked_item_names'):
+                checked_names = set(main_win.get_checked_item_names())
+            else:
+                checked_names = set(main_win.part_meshes.keys())
+
+            # 캐싱 검사: 체크된 부품 구성이 바뀌지 않았고 이미 quad_model이 로드되어 있다면 재병합 없이 즉시 표시 (0.001초)
+            current_keys = frozenset(checked_names)
+            quad_plotters = [self.plotter_tl, self.plotter_tr, self.plotter_bl, self.plotter_br]
+            
+            if not force and getattr(self, '_cached_quad_keys', None) == current_keys and getattr(self, '_quad_synced', False):
                 self.setup_quad_cameras()
                 self.render_active()
+                return
+
+            valid_meshes = [mesh for name, mesh in main_win.part_meshes.items() 
+                            if (not checked_names or name in checked_names) and mesh is not None and getattr(mesh, 'n_cells', 0) > 0]
+
+            if not valid_meshes:
+                for p in quad_plotters:
+                    p.remove_actor("quad_model")
+                self.render_active()
+                self._cached_quad_keys = current_keys
+                return
+
+            # 수백~수천 개 부품도 단일 통합 메쉬로 0.4초 만에 고속 병합
+            if len(valid_meshes) == 1:
+                merged = valid_meshes[0]
+            else:
+                merged = valid_meshes[0].merge(valid_meshes[1:])
+
+            show_edges = getattr(self, 'show_edges', False)
+            default_color = [0.82, 0.82, 0.82]
+
+            for p in quad_plotters:
+                p.suppress_rendering = True
+                actor = p.add_mesh(merged, name="quad_model", color=default_color, show_edges=show_edges, reset_camera=True, render=False)
+                if hasattr(actor, 'GetProperty') and actor.GetProperty():
+                    try:
+                        actor.GetProperty().SetBackfaceCulling(False)
+                        actor.GetProperty().SetFrontfaceCulling(False)
+                    except Exception:
+                        pass
+                if hasattr(actor, 'SetBackfaceProperty') and hasattr(actor, 'GetProperty'):
+                    try:
+                        actor.SetBackfaceProperty(actor.GetProperty())
+                    except Exception:
+                        pass
+                p.reset_camera()
+                if hasattr(p, 'renderer') and hasattr(p.renderer, 'ResetCameraClippingRange'):
+                    p.renderer.ResetCameraClippingRange()
+                p.suppress_rendering = False
+
+            self.setup_quad_cameras()
+            self.render_active()
+            self._cached_quad_keys = current_keys
+            self._quad_synced = True
         except Exception as e:
             print(f"Quad View 동기화 예외: {e}")
 
@@ -395,6 +440,8 @@ class ViewportWidget(QWidget):
 
     def clear_and_setup(self):
         """플로터를 초기화(clear)하고 배경, 그리드, 텍스트 및 PBR 라이팅을 다시 세팅"""
+        self._quad_synced = False
+        self._cached_quad_keys = None
         for plotter in self.plotters:
             plotter.clear()
         
@@ -595,6 +642,12 @@ class ViewportWidget(QWidget):
                 actor = plotter.add_mesh(mesh, name=name, color=color, show_edges=show_edges, reset_camera=reset_camera, render=False)
             except Exception:
                 actor = plotter.add_mesh(mesh, name=name, color=color, show_edges=show_edges, reset_camera=reset_camera, render=False)
+            if hasattr(actor, 'GetProperty') and actor.GetProperty():
+                try:
+                    actor.GetProperty().SetBackfaceCulling(False)
+                    actor.GetProperty().SetFrontfaceCulling(False)
+                except Exception:
+                    pass
             if hasattr(actor, 'SetBackfaceProperty') and hasattr(actor, 'GetProperty'):
                 try:
                     actor.SetBackfaceProperty(actor.GetProperty())

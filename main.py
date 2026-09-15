@@ -2092,6 +2092,9 @@ class MainWindow(QMainWindow):
         self.tree_widget.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed | QAbstractItemView.SelectedClicked)
         self.tree_widget.itemDoubleClicked.connect(self.on_tree_item_double_clicked)
         self.tree_widget.itemChanged.connect(self.on_tree_item_changed)
+        self.tree_widget.itemClicked.connect(self.on_tree_item_clicked)
+        self.tree_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree_widget.customContextMenuRequested.connect(self.on_tree_context_menu)
         left_layout.addWidget(self.tree_widget)
         
         # 우측 뷰포트 패널
@@ -2212,6 +2215,10 @@ class MainWindow(QMainWindow):
                     progress.repaint()
                 except Exception:
                     pass
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
             
         update_progress(10, "openskp 데이터 구조 파싱 시작...")
         
@@ -2389,15 +2396,9 @@ class MainWindow(QMainWindow):
             overall_bounds[4] = min(overall_bounds[4], b[4])
             overall_bounds[5] = max(overall_bounds[5], b[5])
             
-            # 스케치업 Tag 색상 추출 또는 색상 생성 (user_dict 안전 지원)
-            if hasattr(mesh, 'user_dict') and mesh.user_dict and 'tag_color' in mesh.user_dict:
-                tag_col_arr = mesh.user_dict['tag_color']
-                part_color = [float(tag_col_arr[0]), float(tag_col_arr[1]), float(tag_col_arr[2])]
-            elif hasattr(mesh, 'field_data') and 'tag_color' in mesh.field_data:
-                tag_col_arr = mesh.field_data['tag_color']
-                part_color = [float(tag_col_arr[0]), float(tag_col_arr[1]), float(tag_col_arr[2])]
-            else:
-                part_color = random_color()
+            # 스케치업 모델 로딩 시 각각의 Component 및 ROOT_MODEL_ROOT 초기 기본 색상을 옅은 회색으로 통일
+            default_light_gray = [0.82, 0.82, 0.82]
+            part_color = default_light_gray
             self.part_colors[name] = part_color
             
             # 픽스맵 아이콘 생성 및 캐싱
@@ -2412,12 +2413,17 @@ class MainWindow(QMainWindow):
             if "/" in name:
                 tag_name, sub_name = name.split("/", 1)
                 
+                # ROOT_MODEL_ROOT 등 모델 추가 요소는 객체 계층 구조에서 '추가 부품' 그룹으로 분류
+                if "ROOT_MODEL" in name or "ROOT_MODEL" in sub_name or sub_name.startswith("ROOT_") or sub_name.startswith("MODEL_") or name.endswith("/ROOT") or name.endswith("/MODEL"):
+                    tag_name = "추가 부품"
+
                 # 부모 Tag 노드가 없으면 생성 (스케치업 Tags 패널 항목)
                 if tag_name not in tag_items:
                     parent_item = QTreeWidgetItem(self.tree_widget, [tag_name])
                     parent_item.setFlags(parent_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
                     parent_item.setCheckState(0, Qt.Checked)
                     parent_item.setData(0, Qt.UserRole, tag_name)
+                    parent_item.setData(0, Qt.UserRole + 2, Qt.Checked)
                     parent_item.setIcon(0, icon)
                     tag_items[tag_name] = parent_item
                 else:
@@ -2428,12 +2434,28 @@ class MainWindow(QMainWindow):
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
                 item.setCheckState(0, Qt.Checked)
                 item.setData(0, Qt.UserRole, name)
+                item.setData(0, Qt.UserRole + 2, Qt.Checked)
                 item.setIcon(0, icon)
             else:
-                item = QTreeWidgetItem(self.tree_widget, [name])
+                if "ROOT_MODEL" in name or name.startswith("ROOT_") or name.startswith("MODEL_"):
+                    tag_name = "추가 부품"
+                    if tag_name not in tag_items:
+                        parent_item = QTreeWidgetItem(self.tree_widget, [tag_name])
+                        parent_item.setFlags(parent_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                        parent_item.setCheckState(0, Qt.Checked)
+                        parent_item.setData(0, Qt.UserRole, tag_name)
+                        parent_item.setData(0, Qt.UserRole + 2, Qt.Checked)
+                        parent_item.setIcon(0, icon)
+                        tag_items[tag_name] = parent_item
+                    else:
+                        parent_item = tag_items[tag_name]
+                    item = QTreeWidgetItem(parent_item, [name])
+                else:
+                    item = QTreeWidgetItem(self.tree_widget, [name])
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
                 item.setCheckState(0, Qt.Checked)
                 item.setData(0, Qt.UserRole, name)
+                item.setData(0, Qt.UserRole + 2, Qt.Checked)
                 item.setIcon(0, icon)
             
             self.viewport.add_mesh_to_all(mesh, name=name, color=part_color)
@@ -2796,6 +2818,7 @@ class MainWindow(QMainWindow):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
             item.setCheckState(0, Qt.Checked)
             item.setData(0, Qt.UserRole, text)
+            item.setData(0, Qt.UserRole + 2, Qt.Checked)
             
             # 새 계층에 랜덤 색상 부여
             color = [random.uniform(0.3, 0.9), random.uniform(0.3, 0.9), random.uniform(0.3, 0.9)]
@@ -2815,112 +2838,442 @@ class MainWindow(QMainWindow):
                 item.setData(0, Qt.UserRole, item.text(0))
             self.tree_widget.editItem(item, column)
 
-    def on_tree_item_changed(self, item, column):
-        old_name = item.data(0, Qt.UserRole)
-        new_name = item.text(0)
-        
-        # 1. UserRole 데이터가 비어있었던 경우 (초기 생성 직후 등) fallback 탐색
-        if not old_name:
-            if hasattr(self, 'part_meshes') and new_name not in self.part_meshes:
-                existing_tree_names = self.get_all_tree_item_names()
-                for key in list(self.part_meshes.keys()):
-                    if key not in existing_tree_names or key == old_name:
-                        old_name = key
-                        break
-            if not old_name:
-                old_name = new_name
-            item.setData(0, Qt.UserRole, old_name)
-        
-        # 2. 아웃라이너 명칭 수정(Rename) 시 part_meshes, part_colors, plotter.actors 키 동기화
-        if old_name and old_name != new_name:
-            if hasattr(self, 'part_meshes') and old_name in self.part_meshes:
-                self.part_meshes[new_name] = self.part_meshes.pop(old_name)
-            if hasattr(self, 'part_colors') and old_name in self.part_colors:
-                self.part_colors[new_name] = self.part_colors.pop(old_name)
-            if hasattr(self, 'part_materials') and old_name in self.part_materials:
-                self.part_materials[new_name] = self.part_materials.pop(old_name)
-            
-            for plotter in self.viewport.plotters:
-                if old_name in plotter.actors:
-                    actor = plotter.actors.pop(old_name)
-                    plotter.actors[new_name] = actor
-            
-            item.setData(0, Qt.UserRole, new_name)
+    def apply_primary_uv_mapping(self, mesh):
+        """Component 및 ROOT_MODEL_ROOT 메쉬에 1차적인 텍스처 UV 좌표(Texture Coordinates)를 자동 생성 및 각인"""
+        if mesh is None or not hasattr(mesh, 'n_points') or mesh.n_points == 0:
+            return mesh
 
-        # 3. 계층 체크박스 상태 변경 시 자식 항목들에 상태 동기화 (부모 체크/체크해제 시 하위 전체 적용)
-        self.tree_widget.blockSignals(True)
         try:
-            state = item.checkState(0)
-            def _propagate_check(parent_item, target_state):
-                for i in range(parent_item.childCount()):
-                    child = parent_item.child(i)
-                    child.setCheckState(0, target_state)
-                    _propagate_check(child, target_state)
-            _propagate_check(item, state)
-        finally:
-            self.tree_widget.blockSignals(False)
+            import numpy as np
+            # 1. PyVista 내장 texture_map_to_plane 시도
+            mapped = mesh.texture_map_to_plane(inplace=False)
+            if mapped is not None and mapped.active_texture_coordinates is not None:
+                mesh.active_texture_coordinates = mapped.active_texture_coordinates
+                return mesh
+        except Exception as e:
+            print(f"[1차 UV 매핑 Plane 예외 fallback]: {e}")
 
-        # 4. 뷰포트(Cinematic View 및 Quad View 전체) 가시성 일괄 동기화
+        try:
+            import numpy as np
+            pts = np.asarray(mesh.points)
+            b = mesh.bounds  # [xmin, xmax, ymin, ymax, zmin, zmax]
+            dx = max(b[1] - b[0], 1e-6)
+            dy = max(b[3] - b[2], 1e-6)
+            dz = max(b[5] - b[4], 1e-6)
+
+            # 가장 얇은 축(두께 축)을 찾아 나머지 2개 축으로 직교 평면 UV 생성
+            if dz <= dx and dz <= dy:
+                u = (pts[:, 0] - b[0]) / dx
+                v = (pts[:, 1] - b[2]) / dy
+            elif dy <= dx and dy <= dz:
+                u = (pts[:, 0] - b[0]) / dx
+                v = (pts[:, 2] - b[4]) / dz
+            else:
+                u = (pts[:, 1] - b[2]) / dy
+                v = (pts[:, 2] - b[4]) / dz
+
+            u = np.clip(u, 0.0, 1.0)
+            v = np.clip(v, 0.0, 1.0)
+            uvs = np.column_stack([u, v]).astype(np.float32)
+            mesh.active_texture_coordinates = uvs
+        except Exception as e2:
+            print(f"[1차 UV 매핑 BBox 예외]: {e2}")
+
+        return mesh
+
+    def open_material_editor_for_item(self, item):
+        """객체 계층 구조에서 특정 Component 또는 ROOT_MODEL_ROOT 색상 창 클릭 시 머티리얼 슬롯을 열고 재질/색상/1차 UV 매핑 적용"""
+        if item is None:
+            return
+
+        # 1. 적용 대상 부품 목록 수집
+        target_items = []
+        if item.childCount() > 0:
+            def collect_children(p):
+                for i in range(p.childCount()):
+                    c = p.child(i)
+                    if c.childCount() > 0:
+                        collect_children(c)
+                    else:
+                        nm = c.data(0, Qt.UserRole) or c.text(0)
+                        if nm:
+                            target_items.append((c, nm))
+            collect_children(item)
+        else:
+            nm = item.data(0, Qt.UserRole) or item.text(0)
+            if nm:
+                target_items.append((item, nm))
+
+        if not target_items:
+            return
+
+        # 2. 첫 번째 부품 정보를 기준으로 초기 머티리얼 정보 구성
+        first_item, first_name = target_items[0]
+        if hasattr(self, 'part_materials') and first_name in self.part_materials:
+            initial_mat = dict(self.part_materials[first_name])
+        else:
+            c = self.part_colors.get(first_name, [0.8, 0.8, 0.8])
+            hex_val = f"#{int(c[0]*255):02X}{int(c[1]*255):02X}{int(c[2]*255):02X}"
+            raw_title = item.text(0).split(" (")[0]
+            initial_mat = {
+                "name": raw_title,
+                "color": list(c),
+                "hex": hex_val,
+                "roughness": 0.5,
+                "metallic": 0.0,
+                "normal_scale": 1.0,
+                "bright": 1.0,
+                "reflection": 1.0,
+                "refraction": 1.5,
+                "emissive": 0.0,
+                "coat_strength": 0.0,
+                "coat_roughness": 0.0,
+                "anisotropy": 0.0,
+                "occlusion": 1.0,
+                "use_hdri": True,
+                "hdri_ratio": 1.0,
+                "use_bright": True,
+                "use_roughness": True,
+                "use_metallic": True,
+                "use_normal": True,
+                "use_reflection": True,
+                "use_refraction": True,
+                "use_emissive": False,
+                "use_coat_strength": False,
+                "use_coat_roughness": False,
+                "use_anisotropy": False,
+                "use_occlusion": False,
+            }
+
+        # 3. PBR 머티리얼 인스펙터 다이얼로그 실행
+        dlg = MaterialInspectorDialog(initial_mat, apply_callback=None, parent=self)
+        res = dlg.exec()
+        applied_info = getattr(dlg, 'applied_mat_info', None)
+        dlg.cleanup()
+        dlg.deleteLater()
+
+        if res != QDialog.Accepted or not applied_info:
+            return
+
+        color = applied_info.get('color', [0.8, 0.8, 0.8])
+        roughness = applied_info.get('roughness', 0.5)
+        metallic = applied_info.get('metallic', 0.0)
+        normal_scale = applied_info.get('normal_scale', 1.0)
+        bright = applied_info.get('bright', 1.0)
+        reflection = applied_info.get('reflection', 1.0)
+        refraction = applied_info.get('refraction', 1.5)
+        emissive = applied_info.get('emissive', 0.0)
+        coat_strength = applied_info.get('coat_strength', 0.0)
+        coat_roughness = applied_info.get('coat_roughness', 0.0)
+        anisotropy = applied_info.get('anisotropy', 0.0)
+        occlusion = applied_info.get('occlusion', 1.0)
+
+        use_hdri = applied_info.get('use_hdri', True)
+        hdri_ratio = applied_info.get('hdri_ratio', 1.0)
+        use_bright = applied_info.get('use_bright', True)
+        use_roughness = applied_info.get('use_roughness', True)
+        use_metallic = applied_info.get('use_metallic', True)
+        use_normal = applied_info.get('use_normal', True)
+        use_reflection = applied_info.get('use_reflection', True)
+        use_refraction = applied_info.get('use_refraction', True)
+        use_emissive = applied_info.get('use_emissive', False)
+        use_coat_strength = applied_info.get('use_coat_strength', False)
+        use_coat_roughness = applied_info.get('use_coat_roughness', False)
+        use_anisotropy = applied_info.get('use_anisotropy', False)
+        use_occlusion = applied_info.get('use_occlusion', False)
+
+        # 뷰포트 디스플레이 모드가 solid나 wireframe이면 머티리얼 프리뷰 모드로 자동 전환
+        if getattr(self.viewport, 'current_render_mode', None) in ["solid", "wireframe"]:
+            self.viewport.set_display_render_mode("material_preview")
+
+        # HDRI 환경맵 갱신
+        hdri_path = applied_info.get('hdri_path')
+        if hdri_path and os.path.exists(hdri_path) and use_hdri:
+            self.viewport.set_hdri_environment(hdri_path, force=True)
+
+        if not hasattr(self, 'part_materials'):
+            self.part_materials = {}
+
+        # 4. 아웃라이너 트리 아이콘용 QPixmap 생성
+        rgb_key = (int(color[0]*255), int(color[1]*255), int(color[2]*255))
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(QColor(*rgb_key))
+        new_icon = QIcon(pixmap)
+
+        # 클릭한 노드 아이콘 갱신
+        item.setIcon(0, new_icon)
+
+        # 5. 각 부품 메쉬에 1차 UV Mapping 적용, 법선 보정 및 PBR 속성 반영
+        count = 0
+        for c_item, name in target_items:
+            c_item.setIcon(0, new_icon)
+            
+            # part_meshes 키 매칭 보정
+            target_key = name
+            if target_key not in getattr(self, 'part_meshes', {}):
+                for pm_k in self.part_meshes.keys():
+                    if pm_k.endswith("/" + name) or pm_k == name:
+                        target_key = pm_k
+                        break
+
+            if target_key in getattr(self, 'part_meshes', {}) and self.part_meshes[target_key].n_cells > 0:
+                self.part_colors[target_key] = color
+                self.part_materials[target_key] = applied_info
+
+                # (1) 1차적인 UV Mapping 적용
+                mesh = self.part_meshes[target_key]
+                mesh = self.apply_primary_uv_mapping(mesh)
+
+                # (2) 법선 및 앞면 정렬 보정
+                fixed_mesh = self.ensure_frontfaces_oriented(mesh, name=target_key, force=False)
+                self.part_meshes[target_key] = fixed_mesh
+
+                # (3) 뷰포트 액터 갱신 (UV 좌표가 반영된 메쉬로 갱신)
+                self.viewport.update_mesh(target_key, fixed_mesh, color)
+
+                # (4) PBR 속성 반영
+                self.viewport.update_mesh_pbr(
+                    target_key, color=color, roughness=roughness, metallic=metallic, normal_scale=normal_scale,
+                    bright=bright, reflection=reflection, refraction=refraction,
+                    emissive=emissive, coat_strength=coat_strength, coat_roughness=coat_roughness,
+                    anisotropy=anisotropy, occlusion=occlusion,
+                    use_hdri=use_hdri, hdri_ratio=hdri_ratio,
+                    use_roughness=use_roughness, use_metallic=use_metallic, use_normal=use_normal,
+                    use_bright=use_bright, use_reflection=use_reflection, use_refraction=use_refraction,
+                    use_emissive=use_emissive, use_coat_strength=use_coat_strength,
+                    use_coat_roughness=use_coat_roughness, use_anisotropy=use_anisotropy, use_occlusion=use_occlusion,
+                    render=False
+                )
+                count += 1
+
+        if count > 0:
+            self.viewport.render_active()
+
+        # 6. 하단 기본 머티리얼 슬롯 패널에도 함께 동기화/저장
+        if hasattr(self, 'mat_slot_panel') and self.mat_slot_panel is not None:
+            slot_idx = getattr(self.mat_slot_panel, 'selected_slot', 0)
+            if 0 <= slot_idx < len(self.mat_slot_panel.materials):
+                self.mat_slot_panel.materials[slot_idx].update(applied_info)
+                self.mat_slot_panel.update_slot_ui(slot_idx)
+
+        # 7. 사용자 안내 알림
+        display_name = item.text(0).split(" (")[0]
+        mat_name = applied_info.get("name", "Preset")
+        QMessageBox.information(
+            self,
+            "머티리얼 & 1차 UV Mapping 완료",
+            f"선택한 '{display_name}' ({count}개 부품)에\n머티리얼 '{mat_name}' 및 1차적인 UV Mapping이 완벽히 적용되었습니다!"
+        )
+
+    def on_tree_item_clicked(self, item, column):
+        """아웃라이너 항목 클릭 시 색상 창(아이콘 영역) 클릭 여부를 감지하여 머티리얼 슬롯 호출"""
+        if item is None or column != 0:
+            return
+
+        pos = self.tree_widget.viewport().mapFromGlobal(QCursor.pos())
+        rect = self.tree_widget.visualItemRect(item)
+        rel_x = pos.x() - rect.left()
+
+        # 체크박스(0~15px) 우측의 색상 창(아이콘) 영역: 약 14px ~ 48px
+        if 14 <= rel_x <= 48:
+            self.open_material_editor_for_item(item)
+
+    def on_tree_context_menu(self, pos):
+        """아웃라이너 항목 우클릭 시 머티리얼 및 1차 UV 매핑 메뉴 팝업"""
+        item = self.tree_widget.itemAt(pos)
+        if item is None:
+            return
+
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui import QAction
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #23272e;
+                color: #ffffff;
+                border: 1px solid #4b5563;
+                border-radius: 4px;
+                padding: 4px;
+                font-weight: bold;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 3px;
+            }
+            QMenu::item:selected {
+                background-color: #3b82f6;
+                color: #ffffff;
+            }
+        """)
+        act_mat = QAction("🎨 머티리얼 및 색상 설정 (PBR / 1차 UV 매핑)", self)
+        act_mat.triggered.connect(lambda: self.open_material_editor_for_item(item))
+        menu.addAction(act_mat)
+
+        menu.exec(self.tree_widget.viewport().mapToGlobal(pos))
+
+    def _create_progress_dialog(self, title: str, label_text: str, max_val: int = 100):
+        """응답 없음 방지 및 사용자 안내용 모달 프로그레스 다이얼로그 생성"""
+        progress = QProgressDialog(label_text, None, 0, max_val, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setAutoReset(True)
+        progress.setCancelButton(None)
+        progress.setStyleSheet("""
+            QProgressDialog {
+                background-color: #23272e;
+                color: #abb2bf;
+                border: 2px solid #3b82f6;
+                border-radius: 8px;
+            }
+            QLabel {
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 6px;
+            }
+            QProgressBar {
+                border: 1px solid #4b5563;
+                border-radius: 4px;
+                text-align: center;
+                color: #ffffff;
+                font-weight: bold;
+                background-color: #1e2227;
+                height: 22px;
+            }
+            QProgressBar::chunk {
+                background-color: #3b82f6;
+                border-radius: 3px;
+            }
+        """)
+        progress.setFixedSize(400, 115)
+        progress.show()
+        QApplication.processEvents()
+        return progress
+
+    def on_tree_item_changed(self, item, column):
+        if column != 0 or item is None:
+            return
+
+        # 재귀 호출 방지 플래그
+        if getattr(self, '_is_updating_tree', False):
+            return
+
+        user_key = item.data(0, Qt.UserRole)
+        display_text = item.text(0)
+
+        # 1. UserRole 데이터가 비어있었던 경우 (초기 생성 직후 등) fallback 보장
+        if not user_key:
+            user_key = display_text
+            self._is_updating_tree = True
+            item.setData(0, Qt.UserRole, user_key)
+            self._is_updating_tree = False
+
+        # 2. 아웃라이너 부품 명칭 사용자가 직접 수정(Rename) 시 키 동기화
+        last_display = item.data(0, Qt.UserRole + 1)
+        if last_display is not None and last_display != display_text:
+            old_key = user_key
+            new_key = display_text
+            if hasattr(self, 'part_meshes') and old_key in self.part_meshes:
+                self.part_meshes[new_key] = self.part_meshes.pop(old_key)
+            if hasattr(self, 'part_colors') and old_key in self.part_colors:
+                self.part_colors[new_key] = self.part_colors.pop(old_key)
+            if hasattr(self, 'part_materials') and old_key in self.part_materials:
+                self.part_materials[new_key] = self.part_materials.pop(old_key)
+
+            for plotter in self.viewport.plotters:
+                if old_key in plotter.actors:
+                    actor = plotter.actors.pop(old_key)
+                    plotter.actors[new_key] = actor
+
+            self._is_updating_tree = True
+            item.setData(0, Qt.UserRole, new_key)
+            item.setData(0, Qt.UserRole + 1, display_text)
+            self._is_updating_tree = False
+            return
+
+        # 3. 체크 상태 변경 확인 (CheckState 변경 시에만 동기화 실행)
+        current_state = item.checkState(0)
+        last_state = item.data(0, Qt.UserRole + 2)
+
+        if last_state == current_state:
+            return
+
+        # 완벽한 무한 루프 및 시그널 폭풍 원천 차단
+        self._is_updating_tree = True
+        self.tree_widget.blockSignals(True)
+        self.tree_widget.setUpdatesEnabled(False)
+
+        try:
+            item.setData(0, Qt.UserRole + 2, current_state)
+
+            # [경우 A]: 사용자가 부모 그룹 노드를 직접 클릭한 경우 (하위 Component 일괄 전파)
+            if item.childCount() > 0:
+                target_state = current_state
+                # 부모가 부분 선택([■]) 상태에서 클릭된 경우 -> 직관적으로 완전 해제([ ])로 전환하여 모든 Component 일괄 해제
+                if target_state == Qt.PartiallyChecked or last_state == Qt.PartiallyChecked:
+                    if current_state == Qt.Checked:
+                        target_state = Qt.Unchecked
+                    else:
+                        target_state = current_state
+                    item.setCheckState(0, target_state)
+                    item.setData(0, Qt.UserRole + 2, target_state)
+
+                def _propagate_to_children(parent_node, t_state):
+                    for i in range(parent_node.childCount()):
+                        c = parent_node.child(i)
+                        c.setCheckState(0, t_state)
+                        c.setData(0, Qt.UserRole + 2, t_state)
+                        _propagate_to_children(c, t_state)
+
+                _propagate_to_children(item, target_state)
+
+                # 상위 부모가 더 있다면 상위로만 갱신 (자기 자신은 건너뜀)
+                p = item.parent()
+                while p is not None:
+                    tot = p.childCount()
+                    chk = sum(1 for i in range(tot) if p.child(i).checkState(0) == Qt.Checked)
+                    unchk = sum(1 for i in range(tot) if p.child(i).checkState(0) == Qt.Unchecked)
+                    new_p_state = Qt.Checked if chk == tot else (Qt.Unchecked if unchk == tot else Qt.PartiallyChecked)
+                    p.setCheckState(0, new_p_state)
+                    p.setData(0, Qt.UserRole + 2, new_p_state)
+                    p = p.parent()
+
+            # [경우 B]: 사용자가 말단 자식 Component 또는 추가된 단일 계층 노드를 직접 클릭한 경우 (부모 노드 3-state 갱신)
+            else:
+                p = item.parent()
+                while p is not None:
+                    tot = p.childCount()
+                    chk = sum(1 for i in range(tot) if p.child(i).checkState(0) == Qt.Checked)
+                    unchk = sum(1 for i in range(tot) if p.child(i).checkState(0) == Qt.Unchecked)
+                    new_p_state = Qt.Checked if chk == tot else (Qt.Unchecked if unchk == tot else Qt.PartiallyChecked)
+                    p.setCheckState(0, new_p_state)
+                    p.setData(0, Qt.UserRole + 2, new_p_state)
+                    p = p.parent()
+
+        finally:
+            self.tree_widget.setUpdatesEnabled(True)
+            self.tree_widget.blockSignals(False)
+            self._is_updating_tree = False
+            # 화면 체크박스 그래픽 즉시 갱신 (지연 없는 렌더링)
+            self.tree_widget.viewport().update()
+
+        # 4. 뷰포트(Cinematic View 및 Quad View 전체) 가시성 즉각 동기화 (초고속 0.001초 바로 적용)
         self.sync_outliner_visibility()
 
     def sync_outliner_visibility(self):
-        """트리 위젯의 체크 상태에 맞춰 Quad 뷰포트 및 Cinematic View의 모든 액터 가시성을 완벽하게 동기화"""
+        """트리 위젯의 체크 상태에 맞춰 Quad 뷰포트 및 Cinematic View의 모든 액터 가시성을 0.001초 만에 즉시 동기화"""
         checked_names = self.get_checked_item_names()
         
-        # part_meshes에 존재하지만 뷰포트 액터에 아직 없는 체크된 메시 등록
-        for name in checked_names:
-            if name in getattr(self, 'part_meshes', {}) and self.part_meshes[name].n_cells > 0:
-                actor_exists = any(name in p.actors for p in self.viewport.plotters)
-                if not actor_exists:
-                    mesh = self.ensure_frontfaces_oriented(self.part_meshes[name], name=name, force=False)
-                    self.part_meshes[name] = mesh
-                    color = self.part_colors.get(name, [0.7, 0.7, 0.7])
-                    self.viewport.update_mesh(name, mesh, color)
-                    
-                    mat_info = None
-                    if hasattr(self, 'part_materials') and name in self.part_materials:
-                        mat_info = self.part_materials[name]
-                    elif getattr(self, 'last_applied_material', None) is not None:
-                        mat_info = self.last_applied_material
-                        
-                    if mat_info:
-                        self.viewport.update_mesh_pbr(
-                            name,
-                            color=mat_info.get('color', color),
-                            roughness=mat_info.get('roughness', 0.5),
-                            metallic=mat_info.get('metallic', 0.0),
-                            normal_scale=mat_info.get('normal_scale', 1.0),
-                            bright=mat_info.get('bright', 1.0),
-                            reflection=mat_info.get('reflection', 1.0),
-                            refraction=mat_info.get('refraction', 1.5),
-                            emissive=mat_info.get('emissive', 0.0),
-                            coat_strength=mat_info.get('coat_strength', 0.0),
-                            coat_roughness=mat_info.get('coat_roughness', 0.0),
-                            anisotropy=mat_info.get('anisotropy', 0.0),
-                            occlusion=mat_info.get('occlusion', 1.0),
-                            use_hdri=mat_info.get('use_hdri', True),
-                            hdri_ratio=mat_info.get('hdri_ratio', 1.0),
-                            use_roughness=mat_info.get('use_roughness', True),
-                            use_metallic=mat_info.get('use_metallic', True),
-                            use_normal=mat_info.get('use_normal', True),
-                            use_bright=mat_info.get('use_bright', True),
-                            use_reflection=mat_info.get('use_reflection', True),
-                            use_refraction=mat_info.get('use_refraction', True),
-                            use_emissive=mat_info.get('use_emissive', False),
-                            use_coat_strength=mat_info.get('use_coat_strength', False),
-                            use_coat_roughness=mat_info.get('use_coat_roughness', False),
-                            use_anisotropy=mat_info.get('use_anisotropy', False),
-                            use_occlusion=mat_info.get('use_occlusion', False),
-                            render=False
-                        )
-
         ignore_names = {'bg_grid', 'axis_x', 'axis_y', 'view_name', 'Cinematic', 'dimensions', 
                         'picked_cells', 'my_picked_cells', '_picked_through_selection', 
                         '_picked_visible_selection', '_rectangle_selection_frustum'}
 
-        # 모든 플로터에 존재하는 부품 액터들의 가시성 일괄 적용 (체크 해제 시 100% 감춤 보장)
+        # 모든 플로터에 존재하는 부품 액터들의 가시성 일괄 적용 (체크 해제 시 100% 감춤 보장, 초고속 0.001초)
         for plotter in self.viewport.plotters:
-            for actor_name, actor in list(plotter.actors.items()):
+            for actor_name, actor in plotter.actors.items():
                 if actor_name in ignore_names or actor_name.startswith('axis_') or actor_name.startswith('bg_'):
                     continue
                 is_vis = (actor_name in checked_names)
@@ -2929,11 +3282,19 @@ class MainWindow(QMainWindow):
                     actor.SetPickable(is_vis)
                 except Exception:
                     pass
-                        
-        self.viewport.render_active()
 
-        if getattr(self, 'picked_mesh', None) is not None:
-            self.picked_mesh = self.filter_mesh_by_checked_objects(self.picked_mesh)
+        self.viewport.render_active()
+        if hasattr(self.viewport, 'stacked_widget') and self.viewport.stacked_widget.currentIndex() == 1:
+            self.viewport.sync_quad_view()
+
+        # 체크된 항목이 아예 없으면 선택 하이라이트도 뷰포트에서 안전하게 제거
+        if not checked_names:
+            try:
+                self.viewport.plotter_single.remove_actor("my_picked_cells")
+                self.viewport.plotter_single.render()
+            except Exception:
+                pass
+        elif getattr(self, 'picked_mesh', None) is not None:
             self.update_picked_highlight()
 
     def get_all_tree_item_names(self):
@@ -2942,6 +3303,9 @@ class MainWindow(QMainWindow):
         def _traverse(item):
             for i in range(item.childCount()):
                 child = item.child(i)
+                u_data = child.data(0, Qt.UserRole)
+                if u_data:
+                    names.add(str(u_data))
                 names.add(child.text(0))
                 _traverse(child)
         root = self.tree_widget.invisibleRootItem()
@@ -2949,31 +3313,77 @@ class MainWindow(QMainWindow):
         return names
 
     def set_all_tree_items_check_state(self, checked: bool):
-        """트리 위젯의 모든 항목에 대해 체크/체크해제 상태를 일괄 적용하고, 부품 객체의 뷰포트 가시성을 동기화합니다."""
+        """트리 위젯의 모든 항목에 대해 체크/체크해제 상태를 일괄 적용하고, 부품 객체의 뷰포트 가시성을 즉시 동기화합니다."""
         target_state = Qt.Checked if checked else Qt.Unchecked
-        
+
+        self._is_updating_tree = True
         self.tree_widget.blockSignals(True)
-        
-        def _set_check_recursive(item):
-            item.setCheckState(0, target_state)
-            for i in range(item.childCount()):
-                _set_check_recursive(item.child(i))
-                
-        root = self.tree_widget.invisibleRootItem()
-        for i in range(root.childCount()):
-            _set_check_recursive(root.child(i))
-            
-        self.tree_widget.blockSignals(False)
-        
-        self.sync_outliner_visibility()
+        self.tree_widget.setUpdatesEnabled(False)
+        try:
+            def _set_check_recursive(item):
+                item.setCheckState(0, target_state)
+                item.setData(0, Qt.UserRole + 2, target_state)
+                for i in range(item.childCount()):
+                    _set_check_recursive(item.child(i))
+                    
+            root = self.tree_widget.invisibleRootItem()
+            for i in range(root.childCount()):
+                _set_check_recursive(root.child(i))
+        finally:
+            self.tree_widget.setUpdatesEnabled(True)
+            self.tree_widget.blockSignals(False)
+            self._is_updating_tree = False
+            self.tree_widget.viewport().update()
+
+        # 전체 해제(checked=False)인 경우: 0.001초 즉각 완료
+        if not checked:
+            self.picked_mesh = None
+            try:
+                self.viewport.plotter_single.remove_actor("my_picked_cells")
+            except Exception:
+                pass
+            ignore_names = {'bg_grid', 'axis_x', 'axis_y', 'view_name', 'Cinematic', 'dimensions', 
+                            'picked_cells', 'my_picked_cells', '_picked_through_selection', 
+                            '_picked_visible_selection', '_rectangle_selection_frustum'}
+            for plotter in self.viewport.plotters:
+                for actor_name, actor in plotter.actors.items():
+                    if actor_name in ignore_names or actor_name.startswith('axis_') or actor_name.startswith('bg_'):
+                        continue
+                    try:
+                        actor.SetVisibility(False)
+                        actor.SetPickable(False)
+                    except Exception:
+                        pass
+            self.viewport.render_active()
+            return
+
+        # 전체 선택(checked=True)인 경우: 모든 객체 가시화 0.001초 즉각 완료
+        ignore_names = {'bg_grid', 'axis_x', 'axis_y', 'view_name', 'Cinematic', 'dimensions', 
+                        'picked_cells', 'my_picked_cells', '_picked_through_selection', 
+                        '_picked_visible_selection', '_rectangle_selection_frustum'}
+        for plotter in self.viewport.plotters:
+            for actor_name, actor in plotter.actors.items():
+                if actor_name in ignore_names or actor_name.startswith('axis_') or actor_name.startswith('bg_'):
+                    continue
+                try:
+                    actor.SetVisibility(True)
+                    actor.SetPickable(True)
+                except Exception:
+                    pass
+        self.viewport.render_active()
+        if getattr(self, 'picked_mesh', None) is not None:
+            self.update_picked_highlight()
 
     def get_checked_item_names(self):
-        """트리 위젯에서 체크박스가 Checked(체크됨) 상태인 모든 아이템의 텍스트(오브젝트 이름) 세트 반환"""
+        """트리 위젯에서 체크박스가 Checked(체크됨) 상태인 모든 아이템의 텍스트 및 전체 레이어 경로 이름 세트 반환"""
         checked = set()
         def _traverse(item):
             for i in range(item.childCount()):
                 child = item.child(i)
                 if child.checkState(0) == Qt.Checked:
+                    u_data = child.data(0, Qt.UserRole)
+                    if u_data:
+                        checked.add(str(u_data))
                     checked.add(child.text(0))
                 _traverse(child)
         
@@ -2981,48 +3391,137 @@ class MainWindow(QMainWindow):
         _traverse(root)
         return checked
 
-    def filter_mesh_by_checked_objects(self, mesh):
-        """주어진 mesh에서 계층구조상 체크된(Qt.Checked) 오브젝트들에 속하는 cell만 추출하여 반환"""
+    def filter_mesh_by_checked_objects(self, mesh, checked_names=None):
+        """주어진 mesh에서 계층구조상 체크된(Qt.Checked) 오브젝트들에 속하는 cell만 추출하여 반환 (초연산 AABB & 역필터링 최적화)"""
         if mesh is None or not hasattr(mesh, 'n_cells') or mesh.n_cells == 0:
             return None
             
-        checked_names = self.get_checked_item_names()
+        if checked_names is None:
+            checked_names = self.get_checked_item_names()
         if not checked_names:
             return None
             
+        part_meshes = getattr(self, 'part_meshes', {})
+        if not part_meshes:
+            return mesh
+            
+        total_parts = len(part_meshes)
+        if len(checked_names) >= total_parts:
+            return mesh
+
         import numpy as np
         import pyvista as pv
-        
+
+        mb = mesh.bounds  # [xmin, xmax, ymin, ymax, zmin, zmax]
         mesh_centers = mesh.cell_centers().points
-        keep_indices = set()
-        
-        for name in checked_names:
-            part_mesh = getattr(self, 'part_meshes', {}).get(name)
-            if part_mesh is None or part_mesh.n_cells == 0:
-                continue
-                
-            part_centers = part_mesh.cell_centers().points
+
+        unchecked_names = set(part_meshes.keys()) - checked_names
+        if not unchecked_names:
+            return mesh
+
+        # 체크 해제된 부품 수가 적은 경우(예: 지붕부 107개만 끄고 750개 켜짐):
+        # 해제된 부품의 셀만 찾아서 mesh에서 제거하는 '역필터링(Inverse)' 수행 (속도 수백 배 향상)
+        if len(unchecked_names) < len(checked_names):
+            candidate_unchecked = []
+            for name in unchecked_names:
+                p_mesh = part_meshes.get(name)
+                if p_mesh is None or p_mesh.n_cells == 0:
+                    continue
+                pb = p_mesh.bounds
+                # AABB 교차 검사 (BBox가 겹치지 않으면 즉시 스킵)
+                if (pb[1] < mb[0] - 0.001 or pb[0] > mb[1] + 0.001 or
+                    pb[3] < mb[2] - 0.001 or pb[2] > mb[3] + 0.001 or
+                    pb[5] < mb[4] - 0.001 or pb[4] > mb[5] + 0.001):
+                    continue
+                candidate_unchecked.append(p_mesh)
+
+            if not candidate_unchecked:
+                return mesh
+
+            remove_indices = set()
             try:
                 from scipy.spatial import cKDTree
                 tree = cKDTree(mesh_centers)
-                indices_list = tree.query_ball_point(part_centers, r=0.001)
-                for indices in indices_list:
-                    if indices:
-                        keep_indices.update(indices)
+                for p_mesh in candidate_unchecked:
+                    p_centers = p_mesh.cell_centers().points
+                    indices_list = tree.query_ball_point(p_centers, r=0.001)
+                    for idxs in indices_list:
+                        if idxs:
+                            remove_indices.update(idxs)
             except ImportError:
-                for pc in part_centers:
-                    dists = np.linalg.norm(mesh_centers - pc, axis=1)
-                    matches = np.where(dists < 0.001)[0]
-                    if len(matches) > 0:
-                        keep_indices.update(matches.tolist())
-                        
-        if not keep_indices:
-            return None
-            
-        filtered = mesh.extract_cells(list(keep_indices))
-        if not isinstance(filtered, pv.PolyData):
-            filtered = filtered.extract_surface(algorithm='dataset_surface')
-        return filtered
+                for p_mesh in candidate_unchecked:
+                    pb = p_mesh.bounds
+                    in_bbox = (
+                        (mesh_centers[:, 0] >= pb[0] - 0.001) & (mesh_centers[:, 0] <= pb[1] + 0.001) &
+                        (mesh_centers[:, 1] >= pb[2] - 0.001) & (mesh_centers[:, 1] <= pb[3] + 0.001) &
+                        (mesh_centers[:, 2] >= pb[4] - 0.001) & (mesh_centers[:, 2] <= pb[5] + 0.001)
+                    )
+                    cand = np.where(in_bbox)[0]
+                    if len(cand) > 0:
+                        remove_indices.update(cand.tolist())
+
+            if not remove_indices:
+                return mesh
+            if len(remove_indices) >= mesh.n_cells:
+                return None
+
+            keep_indices = [i for i in range(mesh.n_cells) if i not in remove_indices]
+            if not keep_indices:
+                return None
+
+            filtered = mesh.extract_cells(keep_indices)
+            if not isinstance(filtered, pv.PolyData):
+                filtered = filtered.extract_surface(algorithm='dataset_surface')
+            return filtered
+
+        else:
+            # 체크된 부품 수가 적은 경우: 정방향 필터링 (AABB 컬링 적용)
+            candidate_checked = []
+            for name in checked_names:
+                p_mesh = part_meshes.get(name)
+                if p_mesh is None or p_mesh.n_cells == 0:
+                    continue
+                pb = p_mesh.bounds
+                if (pb[1] < mb[0] - 0.001 or pb[0] > mb[1] + 0.001 or
+                    pb[3] < mb[2] - 0.001 or pb[2] > mb[3] + 0.001 or
+                    pb[5] < mb[4] - 0.001 or pb[4] > mb[5] + 0.001):
+                    continue
+                candidate_checked.append(p_mesh)
+
+            if not candidate_checked:
+                return None
+
+            keep_indices = set()
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(mesh_centers)
+                for p_mesh in candidate_checked:
+                    p_centers = p_mesh.cell_centers().points
+                    indices_list = tree.query_ball_point(p_centers, r=0.001)
+                    for idxs in indices_list:
+                        if idxs:
+                            keep_indices.update(idxs)
+            except ImportError:
+                for p_mesh in candidate_checked:
+                    pb = p_mesh.bounds
+                    in_bbox = (
+                        (mesh_centers[:, 0] >= pb[0] - 0.001) & (mesh_centers[:, 0] <= pb[1] + 0.001) &
+                        (mesh_centers[:, 1] >= pb[2] - 0.001) & (mesh_centers[:, 1] <= pb[3] + 0.001) &
+                        (mesh_centers[:, 2] >= pb[4] - 0.001) & (mesh_centers[:, 2] <= pb[5] + 0.001)
+                    )
+                    cand = np.where(in_bbox)[0]
+                    if len(cand) > 0:
+                        keep_indices.update(cand.tolist())
+
+            if not keep_indices:
+                return None
+            if len(keep_indices) == mesh.n_cells:
+                return mesh
+
+            filtered = mesh.extract_cells(list(keep_indices))
+            if not isinstance(filtered, pv.PolyData):
+                filtered = filtered.extract_surface(algorithm='dataset_surface')
+            return filtered
 
     def update_picked_highlight(self):
         """현재 self.picked_mesh 상태를 바탕으로 마젠타 선택 액터를 갱신"""

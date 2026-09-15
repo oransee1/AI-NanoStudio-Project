@@ -80,6 +80,24 @@ def load_skp_to_pyvista(skp_path, return_info=False, progress_callback=None):
                 if l_name and str(l_name).strip() not in ['Layer0', 'Untagged']:
                     valid_layers.append(str(l_name).strip())
 
+        # 유효 레이어가 있을 경우 건축 Z축 높이 순서(기초부 -> 축부 -> 수장부 -> 지붕가구부 -> 지붕부)로 정렬
+        def get_layer_z_order(name):
+            n = str(name).strip()
+            if '기초' in n or '기단' in n or '초석' in n:
+                return 0
+            elif '축' in n or '기둥' in n or '주' in n:
+                return 1
+            elif '수장' in n or '수정' in n or '창방' in n or '평방' in n:
+                return 2
+            elif '가구' in n or '도리' in n or '대들보' in n or '서래' in n:
+                return 3
+            elif '지붕' in n or '기와' in n or '막새' in n:
+                return 4
+            return 5
+
+        if valid_layers:
+            valid_layers = sorted(valid_layers, key=get_layer_z_order)
+
         # mesh_index O(1) 사전 색인 매핑 구축 (파싱 속도 초고속화)
         mesh_meta_map = {}
         if hasattr(scene, 'mesh_index') and scene.mesh_index:
@@ -90,23 +108,51 @@ def load_skp_to_pyvista(skp_path, return_info=False, progress_callback=None):
                     if m_idx not in mesh_meta_map:
                         mesh_meta_map[m_idx] = meta
 
+        # 1차 패스: 씬 내 모든 메쉬의 위치 및 Z축 범위 사전 수집
+        prim_meta_list = []
+        z_centers = []
+        total_glb = len(scene.glb_primitives)
+        for i, prim in enumerate(scene.glb_primitives):
+            if progress_callback and total_glb > 0 and i % 100 == 0:
+                pct = 20 + int((i / total_glb) * 5) # 20% ~ 25%
+                progress_callback(pct, f"3D 씬 위치 분석 및 바운딩 박스 사전 수집 중... ({i}/{total_glb})")
+
+            vertices = np.array(prim.positions, dtype=np.float32).reshape(-1, 3)
+            indices = np.array(prim.indices, dtype=np.int32)
+            meta = mesh_meta_map.get(i, None)
+            if len(vertices) > 0 and len(indices) > 0:
+                z_min, z_max = vertices[:, 2].min(), vertices[:, 2].max()
+                z_center = (z_min + z_max) / 2.0
+                z_centers.append(z_center)
+            else:
+                z_center = 0.0
+            prim_meta_list.append((vertices, indices, z_center, meta))
+
+        overall_z_min = min(z_centers) if z_centers else 0.0
+        overall_z_max = max(z_centers) if z_centers else 1.0
+        z_span = overall_z_max - overall_z_min
+
         grouped_actors = {}
         tag_group_counters = {}
         
         t_loop = time.time()
-        total_prims = len(scene.glb_primitives)
-        for i, prim in enumerate(scene.glb_primitives):
+        total_prims = len(prim_meta_list)
+        for i, (vertices, indices, z_center, meta) in enumerate(prim_meta_list):
             if progress_callback and total_prims > 0 and i % 50 == 0:
                 pct = 25 + int((i / total_prims) * 45) # 25% ~ 70%
                 progress_callback(pct, f"3D 메쉬 생성 및 레이어/그룹 추출 중... ({i}/{total_prims})")
 
-            vertices = np.array(prim.positions, dtype=np.float32).reshape(-1, 3)
-            indices = np.array(prim.indices, dtype=np.int32)
             if len(vertices) == 0 or len(indices) == 0:
                 continue
 
-            faces = np.column_stack([np.full(len(indices)//3, 3), indices.reshape(-1, 3)]).ravel()
-            pv_mesh = pv.PolyData(vertices, faces)
+            # 스케치업 앞/뒷면 구분 없이 모든 방향에서 완전한 앞면(양면, Double-Sided Frontface)으로 로딩
+            n_v = len(vertices)
+            double_vertices = np.vstack([vertices, vertices])
+            triangles = indices.reshape(-1, 3)
+            rev_triangles = np.column_stack([triangles[:, 0], triangles[:, 2], triangles[:, 1]]) + n_v
+            double_triangles = np.vstack([triangles, rev_triangles])
+            faces = np.column_stack([np.full(len(double_triangles), 3), double_triangles]).ravel()
+            pv_mesh = pv.PolyData(double_vertices, faces)
             
             # 스케치업 Z-up을 PyVista Y-up으로 보정
             pv_mesh.rotate_x(90, inplace=True)
@@ -116,9 +162,8 @@ def load_skp_to_pyvista(skp_path, return_info=False, progress_callback=None):
             except Exception:
                 pass
             
-            tag_name = "Untagged"
+            tag_name = ""
             sub_name = ""
-            meta = mesh_meta_map.get(i, None)
             if meta:
                 l = getattr(meta, 'layer', None)
                 p = getattr(meta, 'path', None)
@@ -130,30 +175,40 @@ def load_skp_to_pyvista(skp_path, return_info=False, progress_callback=None):
                 d_str = str(d).strip() if d else ""
                 n_str = str(n).strip() if n else ""
                 
-                # 1. 실제 사용자가 지정한 스케치업 Tag(레이어)가 맵핑된 경우
-                if l_str and l_str not in ['Layer0', 'Untagged']:
+                # 1. 메쉬의 layer 속성이 valid_layers 중 하나인 경우
+                if l_str and l_str in valid_layers:
                     tag_name = l_str
-                # 2. path에서 스케치업 씬 상위 컴포넌트 파싱
-                elif p_str and '/' in p_str:
+                
+                # 자식 컴포넌트/그룹 서브이름 추출
+                comp_part = ""
+                if p_str and '/' in p_str:
                     path_parts = [pt.strip() for pt in p_str.split('/') if pt.strip()]
                     if len(path_parts) >= 2 and path_parts[0] == 'ROOT':
-                        tag_name = path_parts[1]
+                        comp_part = path_parts[1]
                     elif len(path_parts) >= 1:
-                        tag_name = path_parts[0]
-                # 3. definition_name 사용
+                        comp_part = path_parts[0]
                 elif d_str:
-                    tag_name = d_str
+                    comp_part = d_str
                     
-                if n_str:
-                    sub_name = n_str
-                elif d_str:
-                    sub_name = d_str
-                elif p_str and '/' in p_str:
-                    path_parts = [pt.strip() for pt in p_str.split('/') if pt.strip()]
-                    sub_name = path_parts[-1]
+                sub_part = n_str if n_str else (d_str if d_str else "")
+                if comp_part and sub_part and comp_part != sub_part:
+                    sub_name = f"{comp_part}_{sub_part}"
+                elif comp_part:
+                    sub_name = comp_part
+                elif sub_part:
+                    sub_name = sub_part
 
-            if tag_name in ['Untagged', 'Layer0', 'ROOT_MODEL'] and valid_layers:
-                tag_name = valid_layers[i % len(valid_layers)]
+            # ROOT_MODEL_ROOT 등 최상위/추가 래퍼 메쉬는 모델에 필요한 요소이므로 '추가 부품' 그룹으로 분류
+            is_extra_part = ("ROOT_MODEL" in sub_name or sub_name in ["ROOT", "MODEL", "ROOT_MODEL_ROOT", "MODEL_ROOT"])
+            if is_extra_part:
+                tag_name = "추가 부품"
+            elif not tag_name or tag_name not in valid_layers:
+                if valid_layers:
+                    rel_z = (z_center - overall_z_min) / z_span if z_span > 0 else 0.0
+                    layer_idx = min(int(rel_z * len(valid_layers)), len(valid_layers) - 1)
+                    tag_name = valid_layers[layer_idx]
+                else:
+                    tag_name = "Untagged"
 
             if not sub_name:
                 sub_name = "Group"

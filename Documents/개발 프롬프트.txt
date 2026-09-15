@@ -1,0 +1,294 @@
+SketchUp 버전: {{8.0.4811}}
+발견된 레이어: ['Layer0', '기초부', '축부', '수장부', '지붕부', '지붕가구부']
+[14:09:13.982] [INFO] [ACTION] LOAD_SKP_SUCCESS | 로드 완료 | 총 854개 부품 감지: ['기초부/ROOT_1', '축부/ROOT_1', '수장부/ROOT_1', '지붕부/ROOT_1', '지붕가구부/ROOT_1']...
+
+=== 레이어별 세부 그룹 수 분포 ===
+  • 기초부: 1 Groups
+  • 축부: 1 Groups
+  • 수장부: 1 Groups
+  • 지붕부: 1 Groups
+  • 지붕가구부: 1 Groups
+  • Component_66805: 8 Groups
+  • Component_67657: 62 Groups
+  • Component_61226: 8 Groups
+  • Component_66745: 3 Groups
+  • Component_67597: 2 Groups
+  • Component_66649: 8 Groups
+  • Component_67275: 3 Groups
+  • Component_60473: 24 Groups
+  • Component_67030: 2 Groups
+  • Component_59024: 10 Groups
+  • Component_56138: 9 Groups
+  • Component_73194: 1 Groups
+  • Component_73843: 1 Groups
+  • Component_73554: 1 Groups
+  • Component_74203: 1 Groups
+  • Component_72898: 1 Groups
+  • Component_72531: 1 Groups
+  • Component_55553: 1 Groups
+  • Component_59785: 8 Groups
+  • Component_66002: 1 Groups
+  • Component_55849: 1 Groups
+  • Component_54566: 1 Groups
+  • Component_72827: 1 Groups
+  • Component_73483: 1 Groups
+  • Component_74132: 1 Groups
+  • Component_72261: 1 Groups
+  • Component_71714: 1 Groups
+  • Component_71839: 1 Groups
+  • Component_71785: 1 Groups
+  • Component_71947: 1 Groups
+  • Component_71893: 1 Groups
+  • Component_72160: 4 Groups
+  • Component_74499: 1 Groups
+  • Component_72106: 1 Groups
+  • Component_72366: 1 Groups
+  • Component_72001: 1 Groups
+  • Component_72214: 1 Groups
+  • Component_72471: 1 Groups
+  • Component_74553: 1 Groups
+  • Component_74600: 52 Groups
+  • Component_74611: 76 Groups
+  • Component_74879: 2 Groups
+  • Component_49833: 6 Groups
+  • Component_100222: 58 Groups
+  • Component_98649: 2 Groups
+  • Component_96460: 170 Groups
+  • Component_97075: 2 Groups
+  • Component_46306: 13 Groups
+  • Component_46692: 54 Groups
+  • Component_96663: 16 Groups
+  • Component_96060: 64 Groups
+  • Component_74939: 16 Groups
+  • Component_47454: 6 Groups
+  • Component_46961: 6 Groups
+  • Component_48231: 6 Groups
+  • Component_51405: 6 Groups
+  • Component_102013: 8 Groups
+  • Component_47969: 2 Groups
+  • Component_47206: 6 Groups
+  • Component_47707: 2 Groups
+  • Component_76228: 21 Groups
+  • Component_76235: 2 Groups
+  • Component_52977: 2 Groups
+  • Component_46699: 2 Groups
+  • Component_54550: 72 Groups
+
+=== 로드된 샘플 부품 명칭 리스트 (상위 30개) ===
+  - 기초부/ROOT_1
+  - 축부/ROOT_1
+  - 수장부/ROOT_1
+  - 지붕부/ROOT_1
+  - 지붕가구부/ROOT_1
+  - Component_66805/Group#32_1
+  - Component_67657/Group#23_1
+  - Component_67657/Group#23_2
+  - Component_61226/Group#36_1
+  - Component_67657/Group#23_3
+  - Component_66745/Group#33_1
+  - Component_67657/Group#23_4
+  - Component_67657/Group#23_5
+  - Component_67657/Group#23_6
+  - Component_67657/Group#23_7
+  - Component_67657/Group#23_8
+  - Component_67657/Group#23_9
+  - Component_67657/Group#23_10
+  - Component_66805/Group#32_2
+  - Component_67597/Group#30_1
+  - Component_67657/Group#23_11
+  - Component_66649/Group#34_1
+  - Component_61226/Group#36_2
+  - Component_67657/Group#23_12
+  - Component_67657/Group#23_13
+  - Component_67275/Group#31_1
+  - Component_66745/Group#33_2
+  - Component_67275/Group#31_2
+  - Component_66649/Group#34_2
+  - Component_60473/Group#37_1
+  ... 외 824개 부품 추가 로드 완료
+
+
+
+
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+
+SketchUp 버전: {{8.0.4811}}
+발견된 레이어: ['Layer0', '기초부', '축부', '수장부', '지붕부', '지붕가구부']
+[04:00:24.260] [INFO] [ACTION] LOAD_SKP_SUCCESS | 로드 완료 | 총 854개 부품 감지: ['수장부/ROOT_MODEL_ROOT_1', '수장부/ROOT_MODEL_ROOT_2', '지붕부/ROOT_MODEL_ROOT_1', '지붕부/ROOT_MODEL_ROOT_2', '수장부/ROOT_MODEL_ROOT_3']...
+
+=== 레이어별 세부 그룹 수 분포 ===
+  • 수장부: 274 Groups
+  • 지붕부: 107 Groups
+  • 지붕가구부: 183 Groups
+  • 축부: 185 Groups
+  • 기초부: 105 Groups
+
+=== 로드된 샘플 부품 명칭 리스트 (상위 30개) ===
+  - 수장부/ROOT_MODEL_ROOT_1
+  - 수장부/ROOT_MODEL_ROOT_2
+  - 지붕부/ROOT_MODEL_ROOT_1
+  - 지붕부/ROOT_MODEL_ROOT_2
+  - 수장부/ROOT_MODEL_ROOT_3
+  - 지붕가구부/Component_66805_Group#32_1
+  - 지붕가구부/Component_67657_Group#23_1
+  - 지붕가구부/Component_67657_Group#23_2
+  - 지붕가구부/Component_61226_Group#36_1
+  - 지붕가구부/Component_67657_Group#23_3
+  - 수장부/Component_66745_Group#33_1
+  - 지붕가구부/Component_67657_Group#23_4
+  - 지붕가구부/Component_67657_Group#23_5
+  - 지붕가구부/Component_67657_Group#23_6
+  - 지붕가구부/Component_67657_Group#23_7
+  - 지붕가구부/Component_67657_Group#23_8
+  - 지붕가구부/Component_67657_Group#23_9
+  - 지붕가구부/Component_67657_Group#23_10
+  - 지붕가구부/Component_66805_Group#32_2
+  - 지붕부/Component_67597_Group#30_1
+  - 지붕가구부/Component_67657_Group#23_11
+  - 지붕가구부/Component_66649_Group#34_1
+  - 지붕가구부/Component_61226_Group#36_2
+  - 지붕가구부/Component_67657_Group#23_12
+  - 지붕가구부/Component_67657_Group#23_13
+  - 수장부/Component_67275_Group#31_1
+  - 지붕가구부/Component_66745_Group#33_1
+  - 지붕가구부/Component_67275_Group#31_1
+  - 지붕가구부/Component_66649_Group#34_2
+  - 지붕가구부/Component_60473_Group#37_1
+  ... 외 824개 부품 추가 로드 완료
+
+
+
+
+//================================================
+
+객체 계층 구조에서 수장부를 체크해제하면 곧바로 수장부 내부에 있는 Componet들이 바로 체크 해제 되어야 하는데, 현재는 그룹과
+그룹 내부에 있는  Componet들이 유기적으로 작동하지 않는거 같아. 바로 바로 유기적으로 반응할 수 있도록 해줘!
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+스케치업 파일(.skp) 로딩시 해당 파일이 로딩되면 불러온 데이터 값이 존재해서 계속 부담을 주는거 아닌가? 로딩 이후에는 사라져야 되는거 아닌가?
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+  - 수장부/ROOT_MODEL_ROOT_1
+  - 수장부/ROOT_MODEL_ROOT_2
+  - 지붕부/ROOT_MODEL_ROOT_1
+  - 지붕부/ROOT_MODEL_ROOT_2
+  - 수장부/ROOT_MODEL_ROOT_3
+
+ROOT_MODEL_ROOT와 Componet가 동시에 존재하는데 Componet만 있으면 되는거 아니가? 2중으로 있어서 연산 오류가나는거 아닌가?
+ROOT_MODEL_ROOT 삭제 가능하면 삭제해서 계층 구조 만들어줘.
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+객체 계층 구조의 해당 그룹을 체크하거나 해제할때 **ProgressBar와 함께 진행상황을 알려주도록 메세지 창**을 띄워서 연산 진행 상황을 알려줘.
+다른 화면을 누르면 **응답없음**이 발생해서 불안정하게 종료되는걸 막아줘!
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+
+
+SketchUp 버전: {{8.0.4811}}
+발견된 레이어: ['Layer0', '기초부', '축부', '수장부', '지붕부', '지붕가구부']
+[05:32:30.539] [INFO] [ACTION] LOAD_SKP_SUCCESS | 로드 완료 | 총 849개 부품 감지: ['지붕가구부/Component_66805_Group#32_1', '지붕가구부/Component_67657_Group#23_1', '지붕가구부/Component_67657_Group#23_2', '지붕가구부/Component_61226_Group#36_1', '지붕가구부/Component_67657_Group#23_3']...
+
+=== 레이어별 세부 그룹 수 분포 ===
+  • 지붕가구부: 183 Groups
+  • 수장부: 271 Groups
+  • 지붕부: 105 Groups
+  • 축부: 185 Groups
+  • 기초부: 105 Groups
+
+=== 로드된 샘플 부품 명칭 리스트 (상위 30개) ===
+  - 지붕가구부/Component_66805_Group#32_1
+  - 지붕가구부/Component_67657_Group#23_1
+  - 지붕가구부/Component_67657_Group#23_2
+  - 지붕가구부/Component_61226_Group#36_1
+  - 지붕가구부/Component_67657_Group#23_3
+  - 수장부/Component_66745_Group#33_1
+  - 지붕가구부/Component_67657_Group#23_4
+  - 지붕가구부/Component_67657_Group#23_5
+  - 지붕가구부/Component_67657_Group#23_6
+  - 지붕가구부/Component_67657_Group#23_7
+  - 지붕가구부/Component_67657_Group#23_8
+  - 지붕가구부/Component_67657_Group#23_9
+  - 지붕가구부/Component_67657_Group#23_10
+  - 지붕가구부/Component_66805_Group#32_2
+  - 지붕부/Component_67597_Group#30_1
+  - 지붕가구부/Component_67657_Group#23_11
+  - 지붕가구부/Component_66649_Group#34_1
+  - 지붕가구부/Component_61226_Group#36_2
+  - 지붕가구부/Component_67657_Group#23_12
+  - 지붕가구부/Component_67657_Group#23_13
+  - 수장부/Component_67275_Group#31_1
+  - 지붕가구부/Component_66745_Group#33_1
+  - 지붕가구부/Component_67275_Group#31_1
+  - 지붕가구부/Component_66649_Group#34_2
+  - 지붕가구부/Component_60473_Group#37_1
+  - 지붕부/Component_60473_Group#37_1
+  - 지붕가구부/Component_60473_Group#37_2
+  - 지붕부/Component_60473_Group#37_2
+  - 수장부/Component_67030_Group#22_1
+  - 수장부/Component_67030_Group#22_2
+  ... 외 819개 부품 추가 로드 완료
+
+
+//================================================
+
+  - 수장부/ROOT_MODEL_ROOT_1
+  - 수장부/ROOT_MODEL_ROOT_2
+  - 지붕부/ROOT_MODEL_ROOT_1
+  - 지붕부/ROOT_MODEL_ROOT_2
+  - 수장부/ROOT_MODEL_ROOT_3
+
+모델에 필요한 요소이므로 로딩시 불러오는데 객체 계층 구조에서는 **추가 부품**그룹을 만들어서 그 안에 넣어서 작업을 진행할 수 있게 해줘.
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+추가된 객체 계층 구조에서도 객체 계층 구조의 해당 그룹을 체크하거나 해제할때 **ProgressBar와 함께 진행상황을 알려주도록 메세지 창**을 띄워서 연산 진행 상황을 알려줘.
+다른 화면을 누르면 **응답없음**이 발생해서 불안정하게 종료되는걸 막아줘!
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+객체 계층 구조에서 해당 요소를 체크하거나 체크 해제시 바로 적용되도록 해줘.
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+스케치업 파일(.skp) 파일을 로딩할때, 앞,뒷면아 아니라 모든 방향의 앞면(양면)으로 로딩해줘. 가능해?
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+객체 계층 구조에서 각각의 Component 및 ROOT_MODEL_ROOT 에 재질 및 색상을 적용할 수 있도록 각각의 Component 및 ROOT_MODEL_ROOT 앞에 있는 색상 창을 누르면 
+기본 머터리얼 슬롯이 열리고 슬롯의 재질 및 색상을 적용하고 저장하여 해당 Component 및 ROOT_MODEL_ROOT에 1차적인 UV Mapping 이 이루어지도록 해줘. 가능해?
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+스케치업 파일(.skp) 파일을 로딩할때, 객체의 계층 구조 각각의 Component 및 ROOT_MODEL_ROOT 에 초기 기본 색상은 옅은 회색으로 통일 시켜줘.
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+직교 뷰를 보려고 눌렸는데, **응답없음**이 나왔어. 직교 뷰를 클릭하면 바로 보이도록 해줘.
+단, 현재 프로그램은 완성도가 매우 높으므로 전체 코드는 락을 걸어서 수정이 필요한 코드블록만 100% 완벽하게 수정해서 완성해줘.
+
+//================================================
+
+
+
+
+
+
+
+
+
+
