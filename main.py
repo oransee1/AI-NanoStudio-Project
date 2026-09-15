@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QFormLayout, QColorDialog, QLineEdit, QCheckBox, QScrollArea, QSizePolicy, QAbstractItemView,
                                QMenu, QInputDialog, QFrame, QGridLayout, QTextEdit, QProgressDialog)
 from PySide6.QtCore import Qt, QEventLoop
-from PySide6.QtGui import QColor, QPixmap, QIcon
+from PySide6.QtGui import QColor, QPixmap, QIcon, QCursor
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
@@ -1809,6 +1809,9 @@ class RubberBandFilter(QObject):
         self.clear_callback = clear_callback
         self.rubber_band = QRubberBand(QRubberBand.Rectangle, target_widget)
         self.origin = QPoint()
+        self.release_pos = QPoint()
+        self.last_rect = QRect()
+        self.is_left_to_right = False
         self.is_active = False
 
     def set_active(self, active):
@@ -1820,6 +1823,7 @@ class RubberBandFilter(QObject):
         if self.is_active and obj == self.target:
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 self.origin = event.pos()
+                self.release_pos = QPoint()
                 self.rubber_band.setGeometry(QRect(self.origin, QSize()))
                 self.rubber_band.show()
                 return False 
@@ -1827,14 +1831,15 @@ class RubberBandFilter(QObject):
                 self.rubber_band.setGeometry(QRect(self.origin, event.pos()).normalized())
                 return False
             elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self.release_pos = event.pos()
+                self.last_rect = QRect(self.origin, self.release_pos).normalized()
+                self.is_left_to_right = (self.origin.x() <= self.release_pos.x())
                 self.rubber_band.hide()
                 # 드래그 거리가 짧으면(단순 클릭) 피킹 초기화
                 if (event.pos() - self.origin).manhattanLength() < 5:
                     if self.clear_callback:
                         from PySide6.QtCore import QTimer
                         QTimer.singleShot(0, self.clear_callback)
-                self.origin = QPoint()
-                # 토글 버튼과 동기화되도록 자동 비활성화(is_active=False) 라인 삭제
                 return False
         return super().eventFilter(obj, event)
 
@@ -2071,18 +2076,22 @@ class MainWindow(QMainWindow):
         # 계층 추가/관리 및 전체 선택/해제 버튼
         self.outliner_btn_layout = QHBoxLayout()
         self.btn_add_node = QPushButton("➕ 계층 추가")
+        self.btn_delete_node = QPushButton("🗑️ 계층 삭제")
         self.btn_select_all = QPushButton("☑️ 전체 선택")
         self.btn_deselect_all = QPushButton("☐ 전체 해제")
         
         self.btn_add_node.setToolTip("새로운 사용자 정의 계층 노드를 추가합니다.")
+        self.btn_delete_node.setToolTip("선택한 계층(Component 또는 부품 그룹)을 아웃라이너 및 3D 뷰포트에서 삭제합니다.")
         self.btn_select_all.setToolTip("아웃라이너의 모든 부품 항목을 선택(체크)합니다.")
         self.btn_deselect_all.setToolTip("아웃라이너의 모든 부품 항목을 해제(체크해제)합니다.")
         
         self.btn_add_node.clicked.connect(self.add_custom_node)
+        self.btn_delete_node.clicked.connect(self.delete_selected_hierarchy_node)
         self.btn_select_all.clicked.connect(lambda: self.set_all_tree_items_check_state(True))
         self.btn_deselect_all.clicked.connect(lambda: self.set_all_tree_items_check_state(False))
         
         self.outliner_btn_layout.addWidget(self.btn_add_node)
+        self.outliner_btn_layout.addWidget(self.btn_delete_node)
         self.outliner_btn_layout.addWidget(self.btn_select_all)
         self.outliner_btn_layout.addWidget(self.btn_deselect_all)
         left_layout.addLayout(self.outliner_btn_layout)
@@ -2592,6 +2601,86 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Clear pick error: {e}")
 
+    def filter_mesh_enclosed_in_rect(self, mesh, rect):
+        """
+        Left-to-Right 마퀴 영역 선택 시, 2D 스크린 직사각형(rect) 내부에
+        100% 완전히 포함(Enclosed)된 면(Cell)만 추출하여 반환합니다.
+        """
+        import numpy as np
+        import pyvista as pv
+
+        if mesh is None or mesh.n_cells == 0 or rect is None or rect.isEmpty():
+            return mesh
+
+        plotter = getattr(self.viewport, 'plotter_single', None)
+        if plotter is None:
+            return mesh
+
+        try:
+            ren = plotter.renderer
+            cam = ren.GetActiveCamera()
+            aspect = ren.GetTiledAspectRatio()
+            mat = cam.GetCompositeProjectionTransformMatrix(aspect, -1, 1)
+
+            M = np.zeros((4, 4))
+            for i in range(4):
+                for j in range(4):
+                    M[i, j] = mat.GetElement(i, j)
+
+            win_size = plotter.window_size
+            W, H = win_size[0], win_size[1]
+            if W <= 0 or H <= 0:
+                return mesh
+
+            pts = mesh.points
+            if len(pts) == 0:
+                return mesh
+
+            pts4 = np.hstack([pts, np.ones((len(pts), 1))])
+            clip = pts4 @ M.T
+
+            w = clip[:, 3]
+            w_safe = np.where(np.abs(w) < 1e-7, 1e-7, w)
+
+            x_ndc = clip[:, 0] / w_safe
+            y_ndc = clip[:, 1] / w_safe
+            z_ndc = clip[:, 2] / w_safe
+
+            screen_x = (x_ndc + 1.0) * 0.5 * W
+            screen_y = (1.0 - y_ndc) * 0.5 * H
+
+            margin = 5
+            rect_x1 = min(rect.x(), rect.x() + rect.width()) - margin
+            rect_x2 = max(rect.x(), rect.x() + rect.width()) + margin
+            rect_y1 = min(rect.y(), rect.y() + rect.height()) - margin
+            rect_y2 = max(rect.y(), rect.y() + rect.height()) + margin
+
+            # 2D 스크린 rect 내부 + Z 화면 앞/뒤 클리핑 평면 내부 여부 판단
+            is_pt_inside = (
+                (screen_x >= rect_x1) & (screen_x <= rect_x2) &
+                (screen_y >= rect_y1) & (screen_y <= rect_y2) &
+                (z_ndc >= -2.0) & (z_ndc <= 2.0)
+            )
+
+            enclosed_cell_indices = []
+            for cell_idx in range(mesh.n_cells):
+                cell_pt_ids = mesh.get_cell(cell_idx).point_ids
+                if len(cell_pt_ids) > 0 and np.all(is_pt_inside[cell_pt_ids]):
+                    enclosed_cell_indices.append(cell_idx)
+
+            if not enclosed_cell_indices:
+                return pv.PolyData()
+            elif len(enclosed_cell_indices) == mesh.n_cells:
+                return mesh
+            else:
+                sub_mesh = mesh.extract_cells(enclosed_cell_indices)
+                if not isinstance(sub_mesh, pv.PolyData):
+                    sub_mesh = sub_mesh.extract_surface(algorithm='dataset_surface')
+                return sub_mesh
+        except Exception as e:
+            print(f"[Enclosed Selection Error]: {e}")
+            return mesh
+
     def on_cell_picked(self, picked_mesh):
         """사용자가 화면에서 면(Cell)을 선택했을 때 호출됨"""
         import pyvista as pv
@@ -2615,6 +2704,13 @@ class MainWindow(QMainWindow):
             return None
             
         new_merged = _get_merged(picked_mesh)
+        
+        # 좌상단 -> 우하단 (Left-to-Right) 마퀴 드래그 시, 영역 내부에 100% 완전 포함(Enclosed)된 면만 선택
+        if hasattr(self, 'rubber_band_filter') and self.rubber_band_filter.is_active:
+            rb = self.rubber_band_filter
+            if rb.is_left_to_right and rb.last_rect is not None and not rb.last_rect.isEmpty() and rb.last_rect.width() >= 5 and rb.last_rect.height() >= 5:
+                new_merged = self.filter_mesh_enclosed_in_rect(new_merged, rb.last_rect)
+
         # 계층구조상 체크된 오브젝트에 속하는 셀만 일차 필터링
         new_merged = self.filter_mesh_by_checked_objects(new_merged)
         
@@ -2670,88 +2766,95 @@ class MainWindow(QMainWindow):
         # 최종 구성된 피킹 영역을 체크 표시된 계층 오브젝트로 한 번 더 엄격히 필터링
         self.picked_mesh = self.filter_mesh_by_checked_objects(final_mesh)
         self.update_picked_highlight()
-    def on_btn_assign(self):
-        """선택된 폴리곤들을 현재 아웃라이너에서 선택된 계층으로 이동 및 색상 변경"""
+    def on_btn_assign(self, target_item=None):
+        """선택된 뷰포트 객체/면을 아웃라이너에서 선택 또는 우클릭한 계층 그룹으로 이동 및 등록"""
         import numpy as np
         import pyvista as pv
-        from PySide6.QtWidgets import QMessageBox
+        from PySide6.QtWidgets import QMessageBox, QTreeWidgetItem
+        from PySide6.QtGui import QIcon, QPixmap, QColor
+        from PySide6.QtCore import Qt
 
         if getattr(self, 'picked_mesh', None) is None:
-            QMessageBox.information(self, "선택된 면 없음", "먼저 R 버튼으로 이동할 폴리곤을 선택해주세요.")
+            QMessageBox.information(self, "선택된 객체/면 없음", "먼저 뷰포트에서 이동할 3D 객체(면)를 선택해 주세요.")
             return
-            
+
         # MultiBlock 대응
         if isinstance(self.picked_mesh, pv.MultiBlock):
             blocks = [b for b in self.picked_mesh if b is not None and b.n_cells > 0]
             if not blocks:
-                QMessageBox.information(self, "선택된 면 없음", "박스로 선택된 영역 내에 폴리곤이 없습니다.")
+                QMessageBox.information(self, "선택된 객체/면 없음", "선택한 영역 내에 폴리곤이 없습니다.")
                 return
             merged_picked = blocks[0].merge(blocks[1:]) if len(blocks) > 1 else blocks[0]
         else:
             merged_picked = self.picked_mesh
-            
-        if merged_picked.n_cells == 0:
-            QMessageBox.information(self, "선택된 면 없음", "박스로 선택된 영역 내에 유효한 폴리곤이 없습니다.")
+
+        if merged_picked is None or merged_picked.n_cells == 0:
+            QMessageBox.information(self, "선택된 객체/면 없음", "선택한 영역 내에 유효한 폴리곤이 없습니다.")
             return
 
-        selected_items = self.tree_widget.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "계층 미선택", "좌측 아웃라이너에서 할당받을 '계층 명칭'을 먼저 선택해주세요.")
-            return
+        # 대상 계층 노드 지정
+        if target_item is None:
+            selected_items = self.tree_widget.selectedItems()
+            if not selected_items:
+                QMessageBox.warning(self, "계층 미선택", "좌측 아웃라이너에서 할당받을 '계층 명칭(그룹)'을 먼저 선택해주세요.")
+                return
+            target_item = selected_items[0]
 
-        target_name = selected_items[0].text(0)
+        # 부모 그룹 항목 및 깨끗한 그룹 이름 추출
+        if target_item.parent() is not None:
+            parent_group_item = target_item.parent()
+        else:
+            parent_group_item = target_item
+
+        group_name = parent_group_item.data(0, Qt.UserRole)
+        if not group_name:
+            raw_text = parent_group_item.text(0)
+            group_name = raw_text.split(" (")[0].strip()
+
         picked_centers = merged_picked.cell_centers().points
 
         # 이동할 셀 매핑 저장 {source_name: [cell_indices]}
         moves = {name: [] for name in self.part_meshes.keys()}
-        
-        # 어떤 원본 메시의 어떤 셀인지 매칭
+
         for name, mesh in self.part_meshes.items():
-            if name == target_name or mesh.n_cells == 0: 
+            if mesh is None or mesh.n_cells == 0:
                 continue
-            
+
             mesh_centers = mesh.cell_centers().points
-            
-            # SciPy cKDTree로 빠르게 매칭 (스케일업에 의한 오차 및 스케치업 특유의 중복(겹침) 면을 모두 잡기 위해 query_ball_point 사용)
             try:
                 from scipy.spatial import cKDTree
                 tree = cKDTree(mesh_centers)
-                # 반경 0.001(1mm) 이내의 '모든' 중심점 인덱스를 찾음 (Z-fighting 면들 동시 추출)
                 indices_list = tree.query_ball_point(picked_centers, r=0.001)
                 for indices in indices_list:
                     if indices:
                         moves[name].extend(indices)
             except ImportError:
-                # Fallback for small selections
                 for pc in picked_centers:
                     dists = np.linalg.norm(mesh_centers - pc, axis=1)
                     matched_indices = np.where(dists < 0.001)[0]
                     if len(matched_indices) > 0:
                         moves[name].extend(matched_indices.tolist())
-                        
+
         changed = False
-        if target_name not in self.part_meshes:
-            self.part_meshes[target_name] = pv.PolyData()
-            
-        target_mesh = self.part_meshes[target_name]
-        new_target_pieces = [target_mesh] if target_mesh.n_cells > 0 else []
-        
+        completely_moved_sources = []
+        new_target_keys = []
+
         for source_name, cell_indices in moves.items():
-            if not cell_indices: continue
-            
+            if not cell_indices:
+                continue
+
             source_mesh = self.part_meshes[source_name]
-            cell_indices = list(set(cell_indices)) # 중복 제거
-            
+            cell_indices = list(set(cell_indices))
+
             # 이동할 셀 추출 (타겟으로 추가)
             extracted = source_mesh.extract_cells(cell_indices)
             if not isinstance(extracted, pv.PolyData):
                 extracted = extracted.extract_surface(algorithm='dataset_surface')
-            new_target_pieces.append(extracted)
-            
+
             # 남길 셀 추출 (소스에서 제거)
             all_cells = np.arange(source_mesh.n_cells)
             keep_cells = np.setdiff1d(all_cells, cell_indices)
-            
+
             if len(keep_cells) > 0:
                 updated_source = source_mesh.extract_cells(keep_cells)
                 if not isinstance(updated_source, pv.PolyData):
@@ -2761,41 +2864,126 @@ class MainWindow(QMainWindow):
                         updated_source = self.ensure_frontfaces_oriented(updated_source)
                     except Exception:
                         pass
+                self.part_meshes[source_name] = updated_source
+                self.viewport.update_mesh(source_name, updated_source, self.part_colors.get(source_name, [0.82, 0.82, 0.82]))
             else:
-                updated_source = pv.PolyData()
-                
-            self.part_meshes[source_name] = updated_source
-            self.viewport.update_mesh(source_name, updated_source, self.part_colors[source_name])
-            changed = True
-            
-        if changed:
-            # 타겟 메시 병합
-            if len(new_target_pieces) > 1:
-                merged_target = new_target_pieces[0].merge(new_target_pieces[1:])
-            elif len(new_target_pieces) == 1:
-                merged_target = new_target_pieces[0]
-            else:
-                merged_target = pv.PolyData()
-                
-            if not isinstance(merged_target, pv.PolyData):
-                merged_target = merged_target.extract_surface(algorithm='dataset_surface')
-                
-            if merged_target.n_cells > 0:
+                completely_moved_sources.append(source_name)
+
+            # 타겟 key 및 sub_name 결정
+            sub_name = source_name.split('/')[-1] if '/' in source_name else source_name
+            target_key = f"{group_name}/{sub_name}"
+
+            if target_key not in self.part_meshes:
+                self.part_meshes[target_key] = pv.PolyData()
+
+            cur_target_mesh = self.part_meshes[target_key]
+            pieces = [cur_target_mesh, extracted] if cur_target_mesh.n_cells > 0 else [extracted]
+            merged_piece = pieces[0].merge(pieces[1:]) if len(pieces) > 1 else pieces[0]
+            if not isinstance(merged_piece, pv.PolyData):
+                merged_piece = merged_piece.extract_surface(algorithm='dataset_surface')
+
+            if merged_piece.n_cells > 0:
                 try:
-                    merged_target = self.ensure_frontfaces_oriented(merged_target)
+                    merged_piece = self.ensure_frontfaces_oriented(merged_piece)
                 except Exception:
                     pass
 
-            self.part_meshes[target_name] = merged_target
-            self.viewport.update_mesh(target_name, merged_target, self.part_colors[target_name])
-            
-            # 모든 뷰포트 플로터에 대해 가시성 동기화
+            self.part_meshes[target_key] = merged_piece
+
+            # 타겟 그룹 색상 적용
+            target_color = self.part_colors.get(group_name, self.part_colors.get(source_name, [0.82, 0.82, 0.82]))
+            self.part_colors[target_key] = target_color
+            self.viewport.update_mesh(target_key, merged_piece, target_color)
+            new_target_keys.append((target_key, sub_name))
+            changed = True
+
+        if changed:
+            self.tree_widget.blockSignals(True)
+            self.tree_widget.setUpdatesEnabled(False)
+
+            # 1. 완벽히 이동된 소스 메시 및 아이템 정리
+            for src_name in completely_moved_sources:
+                self.part_meshes.pop(src_name, None)
+                self.part_colors.pop(src_name, None)
+                self.part_materials.pop(src_name, None)
+                if hasattr(self, 'frontface_locked_parts'):
+                    self.frontface_locked_parts.discard(src_name)
+
+                for plotter in getattr(self.viewport, 'plotters', []):
+                    try:
+                        plotter.remove_actor(src_name)
+                    except Exception:
+                        pass
+
+                root = self.tree_widget.invisibleRootItem()
+                if root:
+                    for i in range(root.childCount()):
+                        parent_node = root.child(i)
+                        if parent_node is None:
+                            continue
+                        found_child = False
+                        for j in range(parent_node.childCount()):
+                            child_node = parent_node.child(j)
+                            if child_node is not None and child_node.data(0, Qt.UserRole) == src_name:
+                                parent_node.removeChild(child_node)
+                                p_cnt = parent_node.childCount()
+                                p_tag = parent_node.data(0, Qt.UserRole) or parent_node.text(0).split(' (')[0]
+                                if p_cnt > 0:
+                                    parent_node.setText(0, f"{p_tag} ({p_cnt} Groups)")
+                                else:
+                                    idx = self.tree_widget.indexOfTopLevelItem(parent_node)
+                                    if idx != -1:
+                                        self.tree_widget.takeTopLevelItem(idx)
+                                found_child = True
+                                break
+                        if not found_child:
+                            if parent_node.data(0, Qt.UserRole) == src_name:
+                                idx = self.tree_widget.indexOfTopLevelItem(parent_node)
+                                if idx != -1:
+                                    self.tree_widget.takeTopLevelItem(idx)
+
+            # 2. 이동 대상 부모 그룹 하위에 신규/갱신 Component 등록
+            group_color = self.part_colors.get(group_name, [0.82, 0.82, 0.82])
+            rgb_key = (int(group_color[0]*255), int(group_color[1]*255), int(group_color[2]*255))
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(QColor(*rgb_key))
+            icon = QIcon(pixmap)
+
+            for t_key, sub_name in new_target_keys:
+                item_exists = False
+                for i in range(parent_group_item.childCount()):
+                    child_node = parent_group_item.child(i)
+                    if child_node.data(0, Qt.UserRole) == t_key:
+                        item_exists = True
+                        child_node.setIcon(0, icon)
+                        break
+
+                if not item_exists:
+                    new_item = QTreeWidgetItem(parent_group_item, [sub_name])
+                    new_item.setFlags(new_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                    new_item.setCheckState(0, Qt.Checked)
+                    new_item.setData(0, Qt.UserRole, t_key)
+                    new_item.setData(0, Qt.UserRole + 2, Qt.Checked)
+                    new_item.setIcon(0, icon)
+
+            # 3. 이동 대상 부모 그룹 카운트 텍스트 갱신
+            c_cnt = parent_group_item.childCount()
+            if c_cnt > 0:
+                parent_group_item.setText(0, f"{group_name} ({c_cnt} Groups)")
+
+            parent_group_item.setExpanded(True)
+
+            self.tree_widget.setUpdatesEnabled(True)
+            self.tree_widget.blockSignals(False)
+
             self.sync_outliner_visibility()
-            
-            # 메시지 창을 띄우기 '전'에 모든 피킹 상태와 하이라이트 레이어를 완벽하게 초기화
             self.on_btn_clear_pick()
-            
-            QMessageBox.information(self, "할당 완료", f"선택한 면들을 '{target_name}' 계층으로 할당했습니다.")
+
+            QMessageBox.information(
+                self,
+                "계층 그룹 이동 완료",
+                f"선택한 객체/면을 '{group_name}' 계층 그룹으로 성공적으로 이동 및 등록했습니다."
+            )
         else:
             self.on_btn_clear_pick()
             QMessageBox.information(self, "매칭 실패", "선택된 폴리곤과 원본 모델의 위치가 일치하지 않아 분할할 수 없습니다.")
@@ -2829,6 +3017,94 @@ class MainWindow(QMainWindow):
             pixmap = QPixmap(16, 16)
             pixmap.fill(QColor(int(color[0]*255), int(color[1]*255), int(color[2]*255)))
             item.setIcon(0, QIcon(pixmap))
+
+    def delete_selected_hierarchy_node(self):
+        """선택한 아웃라이너 계층(Component 또는 부품 그룹)을 객체 계층 구조 및 3D 뷰포트/데이터에서 완전 삭제"""
+        selected_items = self.tree_widget.selectedItems()
+        if not selected_items:
+            QMessageBox.information(self, "선택 항목 없음", "삭제할 계층(Component)을 아웃라이너에서 먼저 선택해 주세요.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "계층 삭제",
+            f"선택한 {len(selected_items)}개 계층/Component 항목을 삭제하시겠습니까?\n"
+            f"3D 뷰포트 및 프로젝트 데이터에서 완전히 제거됩니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.tree_widget.blockSignals(True)
+        self.tree_widget.setUpdatesEnabled(False)
+
+        keys_to_delete = set()
+        items_to_remove = list(selected_items)
+
+        for item in items_to_remove:
+            # 1. 부모 그룹 노드인 경우 하위 자식들의 key 수집
+            child_count = item.childCount()
+            if child_count > 0:
+                for i in range(child_count):
+                    child = item.child(i)
+                    key = child.data(0, Qt.UserRole)
+                    if key:
+                        keys_to_delete.add(key)
+                tag_key = item.data(0, Qt.UserRole)
+                if tag_key and hasattr(self, 'part_meshes') and tag_key in self.part_meshes:
+                    keys_to_delete.add(tag_key)
+            else:
+                # 2. 단일 Component 자식 또는 독립 계층 노드
+                key = item.data(0, Qt.UserRole)
+                if key:
+                    keys_to_delete.add(key)
+
+        # 3. 트리 아이템 제거 및 부모 그룹 갱신
+        for item in items_to_remove:
+            parent_item = item.parent()
+            if parent_item:
+                parent_item.removeChild(item)
+                c_cnt = parent_item.childCount()
+                t_name = parent_item.data(0, Qt.UserRole)
+                if c_cnt > 0:
+                    parent_item.setText(0, f"{t_name} ({c_cnt} Groups)")
+                else:
+                    idx = self.tree_widget.indexOfTopLevelItem(parent_item)
+                    if idx != -1:
+                        self.tree_widget.takeTopLevelItem(idx)
+            else:
+                idx = self.tree_widget.indexOfTopLevelItem(item)
+                if idx != -1:
+                    self.tree_widget.takeTopLevelItem(idx)
+
+        # 4. 데이터 딕셔너리 및 뷰포트 Plotter Actor 제거
+        for key in keys_to_delete:
+            if hasattr(self, 'part_meshes'):
+                self.part_meshes.pop(key, None)
+            if hasattr(self, 'part_colors'):
+                self.part_colors.pop(key, None)
+            if hasattr(self, 'part_materials'):
+                self.part_materials.pop(key, None)
+            if hasattr(self, 'frontface_locked_parts'):
+                self.frontface_locked_parts.discard(key)
+
+            if hasattr(self, 'viewport') and hasattr(self.viewport, 'plotters'):
+                for plotter in self.viewport.plotters:
+                    try:
+                        plotter.remove_actor(key)
+                    except Exception:
+                        pass
+
+        self.tree_widget.setUpdatesEnabled(True)
+        self.tree_widget.blockSignals(False)
+
+        # 5. 뷰포트 렌더링 및 치수 텍스트 갱신
+        if hasattr(self, 'viewport'):
+            self.viewport.render_active()
+        self.update_dimensions_text()
+
+        log_action("DELETE_HIERARCHY_NODES", f"{len(keys_to_delete)}개 Component 항목 삭제 완료")
 
     def on_tree_item_double_clicked(self, item, column):
         """아웃라이너 부품 항목 더블 클릭 시 인라인 명칭 편집(Rename) 모드 실행"""
@@ -3079,10 +3355,14 @@ class MainWindow(QMainWindow):
             self.open_material_editor_for_item(item)
 
     def on_tree_context_menu(self, pos):
-        """아웃라이너 항목 우클릭 시 머티리얼 및 1차 UV 매핑 메뉴 팝업"""
+        """아웃라이너 항목 우클릭 시 계층 이동, 머티리얼 및 삭제 메뉴 팝업"""
         item = self.tree_widget.itemAt(pos)
         if item is None:
             return
+
+        # 우클릭한 항목을 즉시 아웃라이너 선택 항목으로 지정
+        self.tree_widget.setCurrentItem(item)
+        item.setSelected(True)
 
         from PySide6.QtWidgets import QMenu
         from PySide6.QtGui import QAction
@@ -3106,9 +3386,23 @@ class MainWindow(QMainWindow):
                 color: #ffffff;
             }
         """)
+        # 1. 계층 그룹 이동 메뉴
+        act_move = QAction("📦 계층 그룹 이동", self)
+        act_move.setToolTip("뷰포트에서 선택된 객체/면을 현재 우클릭한 계층 그룹으로 이동 및 등록합니다.")
+        act_move.triggered.connect(lambda: self.on_btn_assign(target_item=item))
+        menu.addAction(act_move)
+
+        menu.addSeparator()
+
+        # 2. 머티리얼 및 색상 설정 메뉴
         act_mat = QAction("🎨 머티리얼 및 색상 설정 (PBR / 1차 UV 매핑)", self)
         act_mat.triggered.connect(lambda: self.open_material_editor_for_item(item))
         menu.addAction(act_mat)
+
+        # 3. 계층 삭제 메뉴
+        act_del = QAction("🗑️ 선택 계층 삭제", self)
+        act_del.triggered.connect(self.delete_selected_hierarchy_node)
+        menu.addAction(act_del)
 
         menu.exec(self.tree_widget.viewport().mapToGlobal(pos))
 
@@ -4009,14 +4303,25 @@ class MainWindow(QMainWindow):
                 }
 
                 # 1. 아웃라이너 부품 계층 및 가시성 수집 (재귀적 탐색)
-                def collect_tree_items(parent_item):
+                metadata["tree_hierarchy"] = {}
+                def collect_tree_items(parent_item, parent_tag=None):
                     for i in range(parent_item.childCount()):
                         item = parent_item.child(i)
-                        name = item.text(0)
-                        if name not in metadata["parts"]:
-                            metadata["parts"].append(name)
-                        metadata["visibility"][name] = (item.checkState(0) == Qt.Checked)
-                        collect_tree_items(item)
+                        key = item.data(0, Qt.UserRole) or item.text(0)
+                        
+                        if item.childCount() > 0:
+                            tag_clean = key.split(" (")[0].strip()
+                            if tag_clean not in metadata["tree_hierarchy"]:
+                                metadata["tree_hierarchy"][tag_clean] = []
+                            collect_tree_items(item, parent_tag=tag_clean)
+                        else:
+                            if key not in metadata["parts"]:
+                                metadata["parts"].append(key)
+                            metadata["visibility"][key] = (item.checkState(0) == Qt.Checked)
+                            if parent_tag:
+                                if parent_tag not in metadata["tree_hierarchy"]:
+                                    metadata["tree_hierarchy"][parent_tag] = []
+                                metadata["tree_hierarchy"][parent_tag].append(key)
 
                 collect_tree_items(self.tree_widget.invisibleRootItem())
 
@@ -4123,17 +4428,32 @@ class MainWindow(QMainWindow):
         if not file_path: return
         import json, zipfile, os
         import pyvista as pv
+
+        progress = self._create_progress_dialog(
+            "ANF 프로젝트 불러오기",
+            f"프로젝트 패키지 압축 해제 중...\n{os.path.basename(file_path)}",
+            max_val=100
+        )
+        progress.setValue(5)
+        QApplication.processEvents()
         
         try:
             log_action("LOAD_ANF_START", f"프로젝트 불러오기 시작: {file_path}")
-            # 텍스처 및 번들 파일이 유지되도록 영구 캐시 디렉토리에 압축 해제
             cache_dir = os.path.join(BASE_DIR, "logs", "anf_cache")
             os.makedirs(cache_dir, exist_ok=True)
-            
+
+            progress.setValue(10)
+            progress.setLabelText("프로젝트 파일 패키지 및 텍스처 압축 해제 중...")
+            QApplication.processEvents()
+
             with zipfile.ZipFile(file_path, 'r') as zf:
                 zf.extractall(cache_dir)
             with open(os.path.join(cache_dir, "metadata.json"), "r", encoding="utf-8") as f:
                 metadata = json.load(f)
+
+            progress.setValue(20)
+            progress.setLabelText("메타데이터 분석 및 3D 부품 리스트 구성 중...")
+            QApplication.processEvents()
 
             def resolve_bundled_file(rel_path):
                 if not rel_path:
@@ -4188,14 +4508,67 @@ class MainWindow(QMainWindow):
 
             # 3. 부품 메시, 색상, 가시성 및 개별 PBR 재질 수치 복원
             mesh_files = metadata.get("mesh_files") or {}
-            
-            for name in metadata.get("parts", []):
-                # 신버전 mesh_files 매핑 또는 기본 {name}.vtp 읽기
-                mesh_rel_path = mesh_files.get(name) if mesh_files else None
+            parts_meta = metadata.get("parts", [])
+            tree_hier_meta = metadata.get("tree_hierarchy") or {}
+
+            # mesh_files short-name to full-key lookup table 구성
+            short_to_full_map = {}
+            for k in mesh_files.keys():
+                if "/" in k:
+                    sub_part = k.split("/", 1)[1]
+                    short_to_full_map[sub_part] = k
+                    short_to_full_map[k] = k
+                else:
+                    short_to_full_map[k] = k
+
+            # 복원 대상 전체 메시 키 목록 수집 (중복 제거)
+            all_part_keys = []
+            seen_keys = set()
+
+            def register_key(raw_k):
+                if not raw_k or raw_k.endswith(" Groups)") or (" (" in raw_k and "Groups" in raw_k):
+                    return
+                resolved_k = short_to_full_map.get(raw_k, raw_k)
+                if resolved_k not in seen_keys:
+                    seen_keys.add(resolved_k)
+                    all_part_keys.append(resolved_k)
+
+            if mesh_files:
+                for k in mesh_files.keys():
+                    register_key(k)
+            for k in parts_meta:
+                register_key(k)
+
+            self.tree_widget.blockSignals(True)
+            self.tree_widget.setUpdatesEnabled(False)
+            self.tree_widget.clear()
+
+            tag_items = {}
+            icon_cache = {}
+            total_parts = len(all_part_keys)
+
+            for idx_k, name in enumerate(all_part_keys):
+                if total_parts > 0 and (idx_k % 10 == 0 or idx_k == total_parts - 1):
+                    pct = 20 + int((idx_k / total_parts) * 70) # 20% ~ 90%
+                    progress.setValue(pct)
+                    progress.setLabelText(f"3D 메쉬 및 계층 구조 복원 중... ({idx_k + 1}/{total_parts})")
+                    QApplication.processEvents()
+
+                # VTP 파일 경로 읽기
+                mesh_rel_path = mesh_files.get(name)
+                if not mesh_rel_path:
+                    sub_k = name.split("/")[-1] if "/" in name else name
+                    mesh_rel_path = mesh_files.get(sub_k)
+
                 if mesh_rel_path:
                     mesh_path = os.path.join(cache_dir, mesh_rel_path)
                 else:
+                    clean_name = name.replace('/', '_')
                     mesh_path = os.path.join(cache_dir, f"{name}.vtp")
+                    if not os.path.exists(mesh_path):
+                        mesh_path = os.path.join(cache_dir, f"{clean_name}.vtp")
+                        if not os.path.exists(mesh_path):
+                            mesh_path = os.path.join(cache_dir, f"meshes/{clean_name}.vtp")
 
                 if os.path.exists(mesh_path):
                     try:
@@ -4203,39 +4576,75 @@ class MainWindow(QMainWindow):
                     except Exception as err_m:
                         print(f"메시 로드 실패 ({name}): {err_m}")
 
-                color = metadata.get("colors", {}).get(name, [0.8, 0.8, 0.8])
+                sub_k = name.split("/")[-1] if "/" in name else name
+                color = metadata.get("colors", {}).get(name, metadata.get("colors", {}).get(sub_k, [0.82, 0.82, 0.82]))
                 self.part_colors[name] = color
 
-                if "part_materials" in metadata and metadata["part_materials"] and name in metadata["part_materials"]:
-                    self.part_materials[name] = restore_mat_dict(metadata["part_materials"][name])
+                mat_dict = metadata.get("part_materials", {})
+                if mat_dict and (name in mat_dict or sub_k in mat_dict):
+                    m_data = mat_dict.get(name) or mat_dict.get(sub_k)
+                    self.part_materials[name] = restore_mat_dict(m_data)
 
-                visibility = metadata.get("visibility", {}).get(name, True)
-                
-                # 아웃라이너 트리 아이템 생성 및 색상 아이콘 등록
-                item = QTreeWidgetItem([name])
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
-                item.setCheckState(0, Qt.Checked if visibility else Qt.Unchecked)
-                item.setData(0, Qt.UserRole, name)
-                
-                pixmap = QPixmap(16, 16)
-                pixmap.fill(QColor(int(color[0]*255), int(color[1]*255), int(color[2]*255)))
-                item.setIcon(0, QIcon(pixmap))
-                self.tree_widget.addTopLevelItem(item)
-                
-                # 메쉬가 존재하면 모든 플로터에 등록
+                vis_dict = metadata.get("visibility", {})
+                visibility = vis_dict.get(name, vis_dict.get(sub_k, True))
+
+                # 색상 아이콘 캐싱
+                rgb_key = (int(color[0]*255), int(color[1]*255), int(color[2]*255))
+                if rgb_key not in icon_cache:
+                    pixmap = QPixmap(16, 16)
+                    pixmap.fill(QColor(*rgb_key))
+                    icon_cache[rgb_key] = QIcon(pixmap)
+                icon = icon_cache[rgb_key]
+
+                # 트리 그룹 및 자식 노드 등록
+                tag_name = ""
+                sub_name = name
+
+                if "/" in name:
+                    tag_name, sub_name = name.split("/", 1)
+                else:
+                    for p_tag, c_keys in tree_hier_meta.items():
+                        if name in c_keys or any(c.endswith("/" + name) for c in c_keys):
+                            tag_name = p_tag
+                            break
+
+                if tag_name:
+                    if tag_name not in tag_items:
+                        parent_item = QTreeWidgetItem(self.tree_widget, [tag_name])
+                        parent_item.setFlags(parent_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                        parent_item.setCheckState(0, Qt.Checked)
+                        parent_item.setData(0, Qt.UserRole, tag_name)
+                        parent_item.setIcon(0, icon)
+                        tag_items[tag_name] = parent_item
+                    else:
+                        parent_item = tag_items[tag_name]
+
+                    item = QTreeWidgetItem(parent_item, [sub_name])
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                    item.setCheckState(0, Qt.Checked if visibility else Qt.Unchecked)
+                    item.setData(0, Qt.UserRole, name)
+                    item.setData(0, Qt.UserRole + 2, Qt.Checked if visibility else Qt.Unchecked)
+                    item.setIcon(0, icon)
+                else:
+                    item = QTreeWidgetItem(self.tree_widget, [name])
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
+                    item.setCheckState(0, Qt.Checked if visibility else Qt.Unchecked)
+                    item.setData(0, Qt.UserRole, name)
+                    item.setData(0, Qt.UserRole + 2, Qt.Checked if visibility else Qt.Unchecked)
+                    item.setIcon(0, icon)
+
+                # 메시가 존재하면 모든 플로터에 등록
                 if name in self.part_meshes:
                     mesh = self.part_meshes[name]
                     self.viewport.add_mesh_to_all(mesh, name=name, color=color)
-                    
-                    # 가시성이 꺼져 있다면 액터 제거
+
                     if not visibility:
                         for p in self.viewport.plotters:
                             try:
                                 p.remove_actor(name)
                             except Exception:
                                 pass
-                    
-                    # 저장된 커스텀 PBR 재질 수치가 있다면 반영
+
                     if name in self.part_materials:
                         mat_info = self.part_materials[name]
                         self.viewport.update_mesh_pbr(
@@ -4268,6 +4677,20 @@ class MainWindow(QMainWindow):
                             render=False
                         )
 
+            progress.setValue(92)
+            progress.setLabelText("객체 계층 구조 트리 및 헤더 갱신 중...")
+            QApplication.processEvents()
+
+            # 각 부모 그룹 항목의 텍스트를 카운트 헤더로 업데이트 (예: "지줄가구부 (189 Groups)")
+            for tag_name, parent_item in tag_items.items():
+                c_cnt = parent_item.childCount()
+                if c_cnt > 0:
+                    parent_item.setText(0, f"{tag_name} ({c_cnt} Groups)")
+
+            self.tree_widget.expandAll()
+            self.tree_widget.setUpdatesEnabled(True)
+            self.tree_widget.blockSignals(False)
+
             # 4. 최근 적용된 재질 복원
             if metadata.get("last_applied_material"):
                 self.last_applied_material = restore_mat_dict(metadata["last_applied_material"])
@@ -4276,16 +4699,31 @@ class MainWindow(QMainWindow):
             curr_mode = getattr(self.viewport, 'current_render_mode', 'material_preview')
             self.viewport.set_display_render_mode(curr_mode)
 
+            progress.setValue(98)
+            progress.setLabelText("뷰포트 렌더링 및 카메라 최종 세팅 중...")
+            QApplication.processEvents()
+
             # 6. 카메라 및 뷰포트 전체 재설정 (복원된 모든 객체가 한눈에 꽉 차게 보이도록)
             self.viewport.reset_camera()
             self.update_dimensions_text()
             self.update_window_title(file_path)
-            
+
+            progress.setValue(100)
+            progress.close()
+
             log_action("LOAD_ANF_SUCCESS", f"프로젝트 복원 성공: {os.path.basename(file_path)} | 부품 수: {len(self.part_meshes)}개")
             QMessageBox.information(self, "불러오기 완료", f"프로젝트({len(self.part_meshes)}개 부품, 색상 및 PBR 설정)를 성공적으로 불러왔습니다.")
         except Exception as e:
+            if 'progress' in locals() and progress:
+                progress.close()
             log_action("LOAD_ANF_ERROR", f"불러오기 실패: {e}")
             QMessageBox.critical(self, "불러오기 오류", f"프로젝트 불러오기 중 오류 발생:\n{e}")
+        finally:
+            if 'progress' in locals() and progress:
+                try:
+                    progress.close()
+                except Exception:
+                    pass
 
     def get_model_center(self):
         """전체 모델의 통합 중심점(Center) 반환 (개별 로컬 부품 오목함 반전 버그 방지)"""
