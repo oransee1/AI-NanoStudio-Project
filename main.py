@@ -1558,8 +1558,8 @@ class MaterialSlotPanel(QWidget):
         container = QFrame()
         container.setStyleSheet("""
             QFrame {
-                background-color: rgba(20, 20, 24, 0.92);
-                border: 1px solid #3A3A3D;
+                background-color: #3A3F4B;
+                border: 1px solid #4D5464;
                 border-radius: 6px;
             }
         """)
@@ -1578,7 +1578,7 @@ class MaterialSlotPanel(QWidget):
             header_layout.addWidget(mat_logo_label)
             
         self.lbl_title = QLabel(f"🎨 머티리얼 슬롯 ({len(self.materials)}/100)")
-        self.lbl_title.setStyleSheet("color: #E0E0E0; font-weight: bold; font-size: 11px; border: none;")
+        self.lbl_title.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 11px; border: none;")
         
         btn_add_slot = QPushButton("➕ 슬롯 추가")
         btn_add_slot.setCursor(Qt.PointingHandCursor)
@@ -1600,7 +1600,7 @@ class MaterialSlotPanel(QWidget):
         btn_add_slot.clicked.connect(self.on_add_slot)
         
         lbl_tip = QLabel("💡 좌클릭: 수치/이름 수정 및 적용 | 우클릭: 삭제/이름 변경")
-        lbl_tip.setStyleSheet("color: #888888; font-size: 10px; border: none;")
+        lbl_tip.setStyleSheet("color: #E2E8F0; font-size: 10px; border: none;")
         
         header_layout.addWidget(self.lbl_title)
         header_layout.addWidget(btn_add_slot)
@@ -1721,125 +1721,301 @@ class MaterialSlotPanel(QWidget):
         
         action = menu.exec(btn.mapToGlobal(pos))
         if action == act_rename:
-            new_name, ok = QInputDialog.getText(self, "재질 이름 변경", "새 머티리얼 슬롯 이름을 입력하세요:", text=mat.get('name', ''))
+            new_name, ok = QInputDialog.getText(self, "이름 변경", "새 머티리얼 이름을 입력하세요:", text=mat.get("name", ""))
             if ok and new_name.strip():
-                self.materials[slot_idx]['name'] = new_name.strip()
-                self.update_slot_ui(slot_idx)
+                mat["name"] = new_name.strip()
+                self.rebuild_grid_ui()
+                self.material_changed.emit(self.materials)
         elif action == act_delete:
             if len(self.materials) <= 1:
-                QMessageBox.warning(self, "삭제 불가", "최소 1개 이상의 머티리얼 슬롯이 유지되어야 합니다.")
+                QMessageBox.warning(self, "삭제 불가", "최소 1개의 머티리얼 슬롯은 존재해야 합니다.")
                 return
-            ans = QMessageBox.question(
-                self, "슬롯 삭제 확인",
-                f"정말로 '{mat.get('name')}' 머티리얼 슬롯을 삭제하시겠습니까?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if ans == QMessageBox.Yes:
+            reply = QMessageBox.question(self, "슬롯 삭제", f"'{mat.get('name')}' 슬롯을 삭제하시겠습니까?", QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
                 self.materials.pop(slot_idx)
+                if self.active_index >= len(self.materials):
+                    self.active_index = max(0, len(self.materials) - 1)
                 self.rebuild_grid_ui()
+                self.select_slot(self.active_index)
+                self.material_changed.emit(self.materials)
 
-    def update_slot_ui(self, slot_idx):
-        """수정/기록된 슬롯의 원형 버튼 색상 및 툴팁 실시간 갱신"""
-        if 0 <= slot_idx < len(self.materials) and slot_idx < len(self.slot_buttons):
-            mat = self.materials[slot_idx]
-            btn = self.slot_buttons[slot_idx]
-            hex_color = mat.get('hex', '#CCCCCC')
-            name = mat.get('name', f'Slot #{slot_idx+1}')
-            btn.setToolTip(f"{slot_idx+1}. {name}\n(수정 기록됨 - 좌클릭: 수치수정/재적용 | 우클릭: 삭제/이름변경)")
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {hex_color};
-                    border: 2px solid #555555;
-                    border-radius: 13px;
-                }}
-                QPushButton:hover {{
-                    border: 2px solid #FFFFFF;
-                    background-color: {hex_color};
-                }}
-                QPushButton:pressed {{
-                    border: 2px solid #00E5FF;
-                }}
-            """)
+class VTK2DMarqueeOverlay:
+    """VTK Native Direct 2D Screen Overlay Marquee Box (윤곽선 + 옅은 파란색 반투명 영역 채우기)"""
+    def __init__(self, target_widget, plotter=None):
+        self.target_widget = target_widget
+        self.plotter = plotter
+        self.points = vtk.vtkPoints()
+        self.points.SetNumberOfPoints(4)
+        
+        # 1. 외곽 윤곽선 (PolyLine)
+        self.lines = vtk.vtkCellArray()
+        line_indices = [0, 1, 1, 2, 2, 3, 3, 0]
+        for i in range(0, len(line_indices), 2):
+            line = vtk.vtkPolyLine()
+            line.GetPointIds().SetNumberOfIds(2)
+            line.GetPointIds().SetId(0, line_indices[i])
+            line.GetPointIds().SetId(1, line_indices[i+1])
+            self.lines.InsertNextCell(line)
+            
+        self.polydata_line = vtk.vtkPolyData()
+        self.polydata_line.SetPoints(self.points)
+        self.polydata_line.SetLines(self.lines)
+        
+        # 2. 내부 채우기 면 (Polygon)
+        self.polys = vtk.vtkCellArray()
+        quad = vtk.vtkPolygon()
+        quad.GetPointIds().SetNumberOfIds(4)
+        for i in range(4):
+            quad.GetPointIds().SetId(i, i)
+        self.polys.InsertNextCell(quad)
 
-    def on_slot_clicked(self, slot_idx):
-        """머티리얼 슬롯 클릭 시 최신 수정 수치를 복원하여 인스펙터 오픈 및 적용 시 기록"""
-        if not (0 <= slot_idx < len(self.materials)):
+        self.polydata_fill = vtk.vtkPolyData()
+        self.polydata_fill.SetPoints(self.points)
+        self.polydata_fill.SetPolys(self.polys)
+
+        self.coordinate = vtk.vtkCoordinate()
+        self.coordinate.SetCoordinateSystemToDisplay()
+        
+        # Mapper & Actor for Line (옅은 파란색 외곽선)
+        self.mapper_line = vtk.vtkPolyDataMapper2D()
+        self.mapper_line.SetInputData(self.polydata_line)
+        self.mapper_line.SetTransformCoordinate(self.coordinate)
+        
+        self.actor_line = vtk.vtkActor2D()
+        self.actor_line.SetMapper(self.mapper_line)
+        self.actor_line.GetProperty().SetColor(0.2, 0.6, 1.0) # 옅은 파란색 (#3399FF)
+        self.actor_line.GetProperty().SetLineWidth(2.5)
+        self.actor_line.SetVisibility(False)
+
+        # Mapper & Actor for Fill (옅은 파란색 반투명 채우기)
+        self.mapper_fill = vtk.vtkPolyDataMapper2D()
+        self.mapper_fill.SetInputData(self.polydata_fill)
+        self.mapper_fill.SetTransformCoordinate(self.coordinate)
+        
+        self.actor_fill = vtk.vtkActor2D()
+        self.actor_fill.SetMapper(self.mapper_fill)
+        self.actor_fill.GetProperty().SetColor(0.25, 0.65, 1.0) # 옅은 파란색 (#40A0FF)
+        self.actor_fill.GetProperty().SetOpacity(0.30) # 옅은 반투명 채우기
+        self.actor_fill.SetVisibility(False)
+
+        self.renderer = None
+
+    def _get_render_window(self):
+        try:
+            if hasattr(self.target_widget, 'GetRenderWindow'):
+                return self.target_widget.GetRenderWindow()
+            if self.plotter and hasattr(self.plotter, 'render_window'):
+                return self.plotter.render_window
+        except Exception:
+            pass
+        return None
+
+    def _get_renderer(self):
+        if self.renderer:
+            return self.renderer
+        try:
+            if self.plotter and hasattr(self.plotter, 'renderer') and self.plotter.renderer:
+                self.renderer = self.plotter.renderer
+                return self.renderer
+            if hasattr(self.target_widget, 'renderer') and self.target_widget.renderer:
+                self.renderer = self.target_widget.renderer
+                return self.renderer
+            rw = self._get_render_window()
+            if rw and rw.GetRenderers().GetNumberOfItems() > 0:
+                self.renderer = rw.GetRenderers().GetFirstRenderer()
+                return self.renderer
+        except Exception:
+            pass
+        return self.renderer
+
+    def update_box(self, origin_p, cur_p):
+        ren = self._get_renderer()
+        if not ren:
             return
             
-        mat_info = self.materials[slot_idx]
+        actors2d = ren.GetActors2D()
+        if self.actor_fill not in actors2d:
+            ren.AddActor2D(self.actor_fill)
+        if self.actor_line not in actors2d:
+            ren.AddActor2D(self.actor_line)
+            
+        win_h = self.target_widget.height()
+        if win_h <= 0:
+            rw = self._get_render_window()
+            if rw:
+                win_h = rw.GetSize()[1]
+        if win_h <= 0:
+            win_h = 600
 
-        if hasattr(self, '_inspector_dialog') and self._inspector_dialog is not None:
-            try:
-                self._inspector_dialog.cleanup()
-                self._inspector_dialog.close()
-            except Exception:
-                pass
-            self._inspector_dialog = None
-
-        dlg = MaterialInspectorDialog(mat_info, apply_callback=None, parent=self.window())
-        self._inspector_dialog = dlg
-        res = dlg.exec()
-        applied_info = getattr(dlg, 'applied_mat_info', None)
+        x0, y0 = origin_p.x(), win_h - origin_p.y()
+        x1, y1 = cur_p.x(), win_h - cur_p.y()
         
-        # 다이얼로그 리소스 완벽 해제
-        dlg.cleanup()
-        dlg.deleteLater()
-        self._inspector_dialog = None
+        self.points.SetPoint(0, x0, y0, 0)
+        self.points.SetPoint(1, x1, y0, 0)
+        self.points.SetPoint(2, x1, y1, 0)
+        self.points.SetPoint(3, x0, y1, 0)
+        self.polydata_line.Modified()
+        self.polydata_fill.Modified()
+        
+        # 옅은 파란색으로 일관되게 표시
+        self.actor_line.GetProperty().SetColor(0.2, 0.6, 1.0)
+        self.actor_fill.GetProperty().SetColor(0.25, 0.65, 1.0)
+        self.actor_fill.GetProperty().SetOpacity(0.30)
+            
+        self.actor_line.SetVisibility(True)
+        self.actor_fill.SetVisibility(True)
+        
+        # 실시간 즉각 렌더링 동기화
+        try:
+            rw = self._get_render_window()
+            if rw:
+                rw.Render()
+            elif hasattr(self.target_widget, 'render'):
+                self.target_widget.render()
+        except Exception:
+            pass
 
-        if res == QDialog.Accepted and applied_info:
-            # 1. 수정 및 적용한 머티리얼 파라미터 수치 및 슬롯 이름을 영구 기록(Save/Record)
-            self.materials[slot_idx].update(applied_info)
-            if 'color' in applied_info:
-                c = applied_info['color']
-                hex_val = f"#{int(c[0]*255):02X}{int(c[1]*255):02X}{int(c[2]*255):02X}"
-                self.materials[slot_idx]['hex'] = hex_val
-                
-            # 2. 하단 슬롯 원형 버튼 색상 및 툴팁 갱신
-            self.update_slot_ui(slot_idx)
-
-            # 3. 다이얼로그 소멸 후 메인 뷰포트 부품들에 최신 수치 100% 재적용
-            if self.apply_callback:
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(20, lambda info=dict(self.materials[slot_idx]): self.apply_callback(info))
+    def hide(self):
+        if self.actor_line and self.actor_line.GetVisibility():
+            self.actor_line.SetVisibility(False)
+        if self.actor_fill and self.actor_fill.GetVisibility():
+            self.actor_fill.SetVisibility(False)
 
 class RubberBandFilter(QObject):
-    def __init__(self, target_widget, clear_callback=None):
+    def __init__(self, target_widget, clear_callback=None, plotter=None):
         super().__init__(target_widget)
         self.target = target_widget
+        self.plotter = plotter
         self.clear_callback = clear_callback
-        self.rubber_band = QRubberBand(QRubberBand.Rectangle, target_widget)
+        
+        self.vtk_overlay = VTK2DMarqueeOverlay(target_widget, plotter=plotter)
         self.origin = QPoint()
         self.release_pos = QPoint()
         self.last_rect = QRect()
         self.is_left_to_right = False
         self.is_active = False
+        self.is_dragging = False
+        self.install_all_filters()
+        self.bind_vtk_observers()
+
+    def install_all_filters(self):
+        """target_widget 및 그 하위 모든 뷰포트 자식 위젯들에 eventFilter 전파 설치"""
+        try:
+            self.target.installEventFilter(self)
+            from PySide6.QtWidgets import QWidget
+            for child in self.target.findChildren(QWidget):
+                child.installEventFilter(self)
+        except Exception:
+            pass
+
+    def bind_vtk_observers(self):
+        """
+        VTK 렌더러/인터랙터 직접 옵저버는 피커의 AreaPick 및 HardwareSelector 파이프라인과
+        충돌하므로 바인딩하지 않고, 마우스 이벤트는 격리된 Qt eventFilter로만 정밀 처리합니다.
+        """
+        pass
+
+    def _get_pos_from_vtk(self, iren):
+        try:
+            if iren:
+                vx, vy = iren.GetEventPosition()
+                win_h = self.target.height()
+                if win_h <= 0 and hasattr(iren, 'GetRenderWindow'):
+                    win_h = iren.GetRenderWindow().GetSize()[1]
+                return QPoint(vx, max(0, win_h - vy))
+        except Exception:
+            pass
+        return self._get_pos_from_cursor()
+
+    def _get_pos_from_cursor(self):
+        try:
+            from PySide6.QtGui import QCursor
+            gpos = QCursor.pos()
+            return self.target.mapFromGlobal(gpos)
+        except Exception:
+            return QPoint(0, 0)
+
+    def get_event_pos(self, event, obj=None):
+        try:
+            if hasattr(event, 'position'):
+                pos = event.position().toPoint()
+            elif hasattr(event, 'pos'):
+                pos = event.pos()
+            else:
+                pos = None
+            if pos is not None:
+                if obj is not None and obj != self.target and hasattr(obj, 'mapTo'):
+                    pos = obj.mapTo(self.target, pos)
+                return pos
+        except Exception:
+            pass
+        return self._get_pos_from_cursor()
 
     def set_active(self, active):
         self.is_active = active
+        self.is_dragging = False
         if not active:
-            self.rubber_band.hide()
+            self.vtk_overlay.hide()
+            self.origin = QPoint()
+        else:
+            self.install_all_filters()
+            self.bind_vtk_observers()
+
+    def on_press_event(self, pos=None):
+        if not self.is_active:
+            return
+        if pos is None:
+            pos = self._get_pos_from_cursor()
+        self.origin = pos
+        self.is_dragging = True
+        self.vtk_overlay.update_box(self.origin, self.origin)
+
+    def on_move_event(self, cur_pos=None):
+        if not self.is_active or not self.is_dragging or self.origin.isNull():
+            return
+        if cur_pos is None:
+            cur_pos = self._get_pos_from_cursor()
+        dx = abs(cur_pos.x() - self.origin.x())
+        dy = abs(cur_pos.y() - self.origin.y())
+        if dx >= 2 or dy >= 2:
+            self.vtk_overlay.update_box(self.origin, cur_pos)
+
+    def on_release_event(self, cur_pos=None):
+        if not self.is_active or not self.is_dragging:
+            self.vtk_overlay.hide()
+            return
+        if cur_pos is None:
+            cur_pos = self._get_pos_from_cursor()
+        self.release_pos = cur_pos
+        self.last_rect = QRect(self.origin, self.release_pos).normalized()
+        self.is_left_to_right = (self.origin.x() <= self.release_pos.x())
+        self.vtk_overlay.hide()
+        self.is_dragging = False
+        
+        if (self.release_pos - self.origin).manhattanLength() < 5:
+            if self.clear_callback:
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, self.clear_callback)
+        self.origin = QPoint()
 
     def eventFilter(self, obj, event):
-        if self.is_active and obj == self.target:
-            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                self.origin = event.pos()
-                self.release_pos = QPoint()
-                self.rubber_band.setGeometry(QRect(self.origin, QSize()))
-                self.rubber_band.show()
+        if self.is_active:
+            from PySide6.QtGui import QGuiApplication
+            t = event.type()
+            if t in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick) and event.button() == Qt.LeftButton:
+                pos = self.get_event_pos(event, obj)
+                self.on_press_event(pos)
                 return False 
-            elif event.type() == QEvent.MouseMove and not self.origin.isNull():
-                self.rubber_band.setGeometry(QRect(self.origin, event.pos()).normalized())
-                return False
-            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-                self.release_pos = event.pos()
-                self.last_rect = QRect(self.origin, self.release_pos).normalized()
-                self.is_left_to_right = (self.origin.x() <= self.release_pos.x())
-                self.rubber_band.hide()
-                # 드래그 거리가 짧으면(단순 클릭) 피킹 초기화
-                if (event.pos() - self.origin).manhattanLength() < 5:
-                    if self.clear_callback:
-                        from PySide6.QtCore import QTimer
-                        QTimer.singleShot(0, self.clear_callback)
+            elif t == QEvent.MouseMove:
+                if self.is_dragging or (QGuiApplication.mouseButtons() & Qt.LeftButton):
+                    pos = self.get_event_pos(event, obj)
+                    if not self.is_dragging or self.origin.isNull():
+                        self.on_press_event(pos)
+                    self.on_move_event(pos)
+                    return False
+            elif t == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                pos = self.get_event_pos(event, obj)
+                self.on_release_event(pos)
                 return False
         return super().eventFilter(obj, event)
 
@@ -1918,6 +2094,31 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.update_window_title()
         self.resize(1280, 720)
+
+    def set_titlebar_gray(self):
+        """Windows 10/11 네이티브 타이틀바 캡션 색상을 세련된 짙은 회색(#22252B)으로 적용"""
+        import sys, ctypes
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId())
+                # DWMWA_CAPTION_COLOR = 35, DWMWA_TEXT_COLOR = 36
+                DWMWA_CAPTION_COLOR = 35
+                DWMWA_TEXT_COLOR = 36
+                # COLORREF: 0x00BBGGRR (짙은 회색 #22252B -> R: 0x22, G: 0x25, B: 0x2B -> 0x002B2522)
+                color = ctypes.c_uint(0x002B2522)
+                text_color = ctypes.c_uint(0x00FFFFFF)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, DWMWA_CAPTION_COLOR, ctypes.byref(color), ctypes.sizeof(color)
+                )
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, DWMWA_TEXT_COLOR, ctypes.byref(text_color), ctypes.sizeof(text_color)
+                )
+            except Exception as e:
+                print(f"타이틀바 색상 설정 오류: {e}")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.set_titlebar_gray()
 
     def update_window_title(self, file_path=None):
         """윈도우 타이틀바에 프로그램명과 불러오기/저장된 프로젝트 파일명 표시"""
@@ -2154,6 +2355,7 @@ class MainWindow(QMainWindow):
         self.uv_unwrapper = UVUnwrapper()
         self.loaded_actors = {}
         self.atlas = None
+        self.picked_mesh = None
         
         # 이벤트 연결
         self.btn_load_skp.clicked.connect(self.on_load_skp)
@@ -2184,6 +2386,9 @@ class MainWindow(QMainWindow):
         self.btn_clear_pick.clicked.connect(self.on_btn_clear_pick)
         self.btn_assign.clicked.connect(self.on_btn_assign)
         self.combo_display_mode.currentIndexChanged.connect(self.on_display_mode_changed)
+        
+        # 마퀴(Marquee) 사각형 영역 선택 필터 사전 준비
+        self.ensure_rubber_band_filter()
         
         # 자동 로드 비활성화 (빈 환경으로 시작)
         # auto_load_path = "3d_model/car.skp"
@@ -2502,25 +2707,25 @@ class MainWindow(QMainWindow):
         # 폴리곤(면) 분할 기능을 위한 셀 피킹(Cell Picking) 비활성화 (버튼을 눌러야 활성화됨)
         self.picked_mesh = None
 
-        # 기존의 Qt QRubberBand 필터를 복구하여 시각적 윤곽선을 보장합니다.
-        if not hasattr(self, 'rubber_band_filter'):
-            self.rubber_band_filter = RubberBandFilter(self.viewport.plotter_single.interactor, clear_callback=self.on_btn_clear_pick)
-            self.viewport.plotter_single.interactor.installEventFilter(self.rubber_band_filter)
+    def ensure_rubber_band_filter(self):
+        """마퀴(Marquee) 사각형 영역 선택 필터 인스턴스 보장"""
+        if not hasattr(self, 'rubber_band_filter') or self.rubber_band_filter is None:
+            self.rubber_band_filter = RubberBandFilter(
+                self.viewport.plotter_single.interactor, 
+                clear_callback=self.on_btn_clear_pick,
+                plotter=self.viewport.plotter_single
+            )
+        return self.rubber_band_filter
 
     def on_btn_pick_r(self):
         """박스 면 선택 모드 토글 (R 키 / 관통 선택)"""
         if not self.btn_pick_r.isChecked():
             self.on_btn_clear_pick()
-            # 비활성화 시 QRubberBand도 끄기
-            if hasattr(self, 'rubber_band_filter'):
+            if hasattr(self, 'rubber_band_filter') and self.rubber_band_filter:
                 self.rubber_band_filter.set_active(False)
             return
             
         self.btn_pick_p.setChecked(False)
-        
-        # QRubberBand 시각화 활성화
-        if hasattr(self, 'rubber_band_filter'):
-            self.rubber_band_filter.set_active(True)
 
         try:
             self.viewport.plotter_single.disable_picking()
@@ -2536,12 +2741,15 @@ class MainWindow(QMainWindow):
                 show_message="마우스 왼쪽 버튼으로 드래그하여 영역을 선택하세요."
             )
             
-            # 버튼 클릭 후 뷰포트에서 마우스 왼쪽 클릭 드래그만으로 바로 박스 선택이 되도록 강제 설정
+            # 마퀴 필터 보장 및 활성화
+            rb = self.ensure_rubber_band_filter()
+            rb.set_active(True)
+
             style = self.viewport.plotter_single.iren.get_interactor_style()
             if hasattr(style, 'StartSelect'):
                 def force_start_select(obj, event):
                     obj.StartSelect()
-                style.AddObserver("LeftButtonPressEvent", force_start_select)
+                style.AddObserver("LeftButtonPressEvent", force_start_select, 10.0)
         except Exception as e:
             print(f"피킹 활성화 오류: {e}")
 
@@ -2552,9 +2760,6 @@ class MainWindow(QMainWindow):
             return
             
         self.btn_pick_r.setChecked(False)
-        # 단일 면 선택이므로 박스 선택 윤곽선은 끕니다.
-        if hasattr(self, 'rubber_band_filter'):
-            self.rubber_band_filter.set_active(False)
         try:
             self.viewport.plotter_single.disable_picking()
         except Exception:
@@ -2569,6 +2774,16 @@ class MainWindow(QMainWindow):
                 start=True,
                 show_message="표면의 폴리곤을 클릭/드래그하여 선택하세요. (P)"
             )
+            
+            # 마퀴 필터 보장 및 활성화
+            rb = self.ensure_rubber_band_filter()
+            rb.set_active(True)
+
+            style = self.viewport.plotter_single.iren.get_interactor_style()
+            if hasattr(style, 'StartSelect'):
+                def force_start_select(obj, event):
+                    obj.StartSelect()
+                style.AddObserver("LeftButtonPressEvent", force_start_select, 10.0)
         except Exception as e:
             print(f"피킹 활성화 오류: {e}")
 
@@ -2577,7 +2792,7 @@ class MainWindow(QMainWindow):
         try:
             self.btn_pick_p.setChecked(False)
             self.btn_pick_r.setChecked(False)
-            if hasattr(self, 'rubber_band_filter'):
+            if hasattr(self, 'rubber_band_filter') and self.rubber_band_filter:
                 self.rubber_band_filter.set_active(False)
             try:
                 self.viewport.plotter_single.disable_picking()
@@ -2632,6 +2847,14 @@ class MainWindow(QMainWindow):
             if W <= 0 or H <= 0:
                 return mesh
 
+            # The marquee is stored in Qt widget coordinates while projection
+            # results use the render-window pixel coordinates.
+            viewport_widget = getattr(plotter, 'interactor', None)
+            widget_w = viewport_widget.width() if viewport_widget is not None else W
+            widget_h = viewport_widget.height() if viewport_widget is not None else H
+            scale_x = W / max(widget_w, 1)
+            scale_y = H / max(widget_h, 1)
+
             pts = mesh.points
             if len(pts) == 0:
                 return mesh
@@ -2650,10 +2873,10 @@ class MainWindow(QMainWindow):
             screen_y = (1.0 - y_ndc) * 0.5 * H
 
             margin = 5
-            rect_x1 = min(rect.x(), rect.x() + rect.width()) - margin
-            rect_x2 = max(rect.x(), rect.x() + rect.width()) + margin
-            rect_y1 = min(rect.y(), rect.y() + rect.height()) - margin
-            rect_y2 = max(rect.y(), rect.y() + rect.height()) + margin
+            rect_x1 = (min(rect.x(), rect.x() + rect.width()) - margin) * scale_x
+            rect_x2 = (max(rect.x(), rect.x() + rect.width()) + margin) * scale_x
+            rect_y1 = (min(rect.y(), rect.y() + rect.height()) - margin) * scale_y
+            rect_y2 = (max(rect.y(), rect.y() + rect.height()) + margin) * scale_y
 
             # 2D 스크린 rect 내부 + Z 화면 앞/뒤 클리핑 평면 내부 여부 판단
             is_pt_inside = (
@@ -2665,7 +2888,7 @@ class MainWindow(QMainWindow):
             enclosed_cell_indices = []
             for cell_idx in range(mesh.n_cells):
                 cell_pt_ids = mesh.get_cell(cell_idx).point_ids
-                if len(cell_pt_ids) > 0 and np.all(is_pt_inside[cell_pt_ids]):
+                if len(cell_pt_ids) > 0 and np.any(is_pt_inside[cell_pt_ids]):
                     enclosed_cell_indices.append(cell_idx)
 
             if not enclosed_cell_indices:
@@ -2704,12 +2927,26 @@ class MainWindow(QMainWindow):
             return None
             
         new_merged = _get_merged(picked_mesh)
-        
-        # 좌상단 -> 우하단 (Left-to-Right) 마퀴 드래그 시, 영역 내부에 100% 완전 포함(Enclosed)된 면만 선택
-        if hasattr(self, 'rubber_band_filter') and self.rubber_band_filter.is_active:
-            rb = self.rubber_band_filter
-            if rb.is_left_to_right and rb.last_rect is not None and not rb.last_rect.isEmpty() and rb.last_rect.width() >= 5 and rb.last_rect.height() >= 5:
-                new_merged = self.filter_mesh_enclosed_in_rect(new_merged, rb.last_rect)
+
+        # 1. VTK 하드웨어 셀렉터가 이미 정확히 검출한 표면 셀(new_merged)이 있다면 최우선 채택
+        # 2. VTK 피커가 빈 메쉬를 반환한 경우에만 마퀴 사각형 영역(marquee_rect) 기반 fallback 투영 수행
+        if new_merged is None or new_merged.n_cells == 0:
+            marquee_rect = None
+            if hasattr(self, 'rubber_band_filter') and self.rubber_band_filter.is_active:
+                rb = self.rubber_band_filter
+                if rb.last_rect is not None and not rb.last_rect.isEmpty() and rb.last_rect.width() >= 5 and rb.last_rect.height() >= 5:
+                    marquee_rect = rb.last_rect
+
+            if marquee_rect is not None:
+                checked_names = self.get_checked_item_names()
+                source_meshes = [
+                    part_mesh for name, part_mesh in getattr(self, 'part_meshes', {}).items()
+                    if (not checked_names or name in checked_names)
+                    and part_mesh is not None and part_mesh.n_cells > 0
+                ]
+                if source_meshes:
+                    fallback_merged = source_meshes[0] if len(source_meshes) == 1 else source_meshes[0].merge(source_meshes[1:])
+                    new_merged = self.filter_mesh_enclosed_in_rect(fallback_merged, marquee_rect)
 
         # 계층구조상 체크된 오브젝트에 속하는 셀만 일차 필터링
         new_merged = self.filter_mesh_by_checked_objects(new_merged)
@@ -2767,10 +3004,10 @@ class MainWindow(QMainWindow):
         self.picked_mesh = self.filter_mesh_by_checked_objects(final_mesh)
         self.update_picked_highlight()
     def on_btn_assign(self, target_item=None):
-        """선택된 뷰포트 객체/면을 아웃라이너에서 선택 또는 우클릭한 계층 그룹으로 이동 및 등록"""
+        """선택된 뷰포트 객체의 모든 면(전체)을 아웃라이너에서 선택 또는 우클릭한 계층 그룹으로 이동 및 등록"""
         import numpy as np
         import pyvista as pv
-        from PySide6.QtWidgets import QMessageBox, QTreeWidgetItem
+        from PySide6.QtWidgets import QMessageBox, QTreeWidgetItem, QInputDialog
         from PySide6.QtGui import QIcon, QPixmap, QColor
         from PySide6.QtCore import Qt
 
@@ -2792,28 +3029,67 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "선택된 객체/면 없음", "선택한 영역 내에 유효한 폴리곤이 없습니다.")
             return
 
-        # 대상 계층 노드 지정
-        if target_item is None:
-            selected_items = self.tree_widget.selectedItems()
-            if not selected_items:
-                QMessageBox.warning(self, "계층 미선택", "좌측 아웃라이너에서 할당받을 '계층 명칭(그룹)'을 먼저 선택해주세요.")
-                return
-            target_item = selected_items[0]
+        # 1. 대상 계층 노드 지정 (아웃라이너 미선택 시 편리한 선택 팝업 제공)
+        parent_group_item = None
+        group_name = ""
 
-        # 부모 그룹 항목 및 깨끗한 그룹 이름 추출
-        if target_item.parent() is not None:
-            parent_group_item = target_item.parent()
+        if target_item is not None:
+            if target_item.parent() is not None:
+                parent_group_item = target_item.parent()
+            else:
+                parent_group_item = target_item
         else:
-            parent_group_item = target_item
+            selected_items = self.tree_widget.selectedItems()
+            if selected_items:
+                sel = selected_items[0]
+                if sel.parent() is not None:
+                    parent_group_item = sel.parent()
+                else:
+                    parent_group_item = sel
+            else:
+                # 아웃라이너에서 사전 선택하지 않은 경우: 존재하는 계층 그룹 목록을 팝업으로 안내하여 즉시 이동 지원
+                group_items = []
+                root = self.tree_widget.invisibleRootItem()
+                if root:
+                    for i in range(root.childCount()):
+                        top_node = root.child(i)
+                        if top_node is not None:
+                            g_tag = top_node.data(0, Qt.UserRole) or top_node.text(0).split(' (')[0].strip()
+                            if g_tag:
+                                group_items.append((g_tag, top_node))
 
-        group_name = parent_group_item.data(0, Qt.UserRole)
-        if not group_name:
-            raw_text = parent_group_item.text(0)
-            group_name = raw_text.split(" (")[0].strip()
+                if not group_items:
+                    QMessageBox.warning(self, "계층 미선택", "좌측 아웃라이너에서 할당받을 '계층 명칭(그룹)'을 먼저 선택해주세요.")
+                    return
+
+                group_display_names = [f"{g_name} ({node.text(0)})" if node.text(0) != g_name else g_name for g_name, node in group_items]
+                chosen_display, ok = QInputDialog.getItem(
+                    self,
+                    "계층 그룹 선택",
+                    "선택한 객체를 이동할 대상 계층 그룹을 선택하세요:",
+                    group_display_names,
+                    0,
+                    False
+                )
+                if not ok or not chosen_display:
+                    return
+
+                chosen_idx = group_display_names.index(chosen_display)
+                group_name, parent_group_item = group_items[chosen_idx]
+
+        if parent_group_item is not None and not group_name:
+            group_name = parent_group_item.data(0, Qt.UserRole)
+            if not group_name:
+                raw_text = parent_group_item.text(0)
+                group_name = raw_text.split(" (")[0].strip()
+
+        if not group_name or parent_group_item is None:
+            QMessageBox.warning(self, "계층 미선택", "할당받을 유효한 계층 그룹을 찾지 못했습니다.")
+            return
 
         picked_centers = merged_picked.cell_centers().points
 
-        # 이동할 셀 매핑 저장 {source_name: [cell_indices]}
+        # 2. 이동할 객체 매핑 {source_name: [cell_indices]}
         moves = {name: [] for name in self.part_meshes.keys()}
 
         for name, mesh in self.part_meshes.items():
@@ -2835,65 +3111,117 @@ class MainWindow(QMainWindow):
                     if len(matched_indices) > 0:
                         moves[name].extend(matched_indices.tolist())
 
+        # 2-1. 1차 매칭 실패 시 오차 보정을 위해 반경을 확장(r=0.05)하여 재시도
+        if not any(moves.values()):
+            for name, mesh in self.part_meshes.items():
+                if mesh is None or mesh.n_cells == 0:
+                    continue
+                mesh_centers = mesh.cell_centers().points
+                try:
+                    from scipy.spatial import cKDTree
+                    tree = cKDTree(mesh_centers)
+                    indices_list = tree.query_ball_point(picked_centers, r=0.05)
+                    for indices in indices_list:
+                        if indices:
+                            moves[name].extend(indices)
+                except Exception:
+                    pass
+
+        # 2-2. 최근접 거리(Nearest-Neighbor) fallback 매칭
+        if not any(moves.values()):
+            best_name = None
+            best_dist = float('inf')
+            for name, mesh in self.part_meshes.items():
+                if mesh is None or mesh.n_cells == 0:
+                    continue
+                mesh_centers = mesh.cell_centers().points
+                try:
+                    from scipy.spatial import cKDTree
+                    tree = cKDTree(mesh_centers)
+                    dists, _ = tree.query(picked_centers, k=1)
+                    mean_d = float(np.mean(dists))
+                    if mean_d < best_dist and mean_d < 0.2: # 20cm 이내 최근접
+                        best_dist = mean_d
+                        best_name = name
+                except Exception:
+                    pass
+            if best_name:
+                moves[best_name] = [0]
+
+        matched_sources = [name for name, idxs in moves.items() if len(idxs) > 0]
+        if not matched_sources:
+            self.on_btn_clear_pick()
+            QMessageBox.information(self, "매칭 실패", "선택된 3D 객체와 일치하는 원본 부품 데이터를 찾지 못했습니다.")
+            return
+
+        # 이미 대상 그룹에 속해 있는지 확인
+        already_in_group = [s for s in matched_sources if (s.split('/')[0] if '/' in s else '') == group_name]
+        if len(already_in_group) == len(matched_sources):
+            self.on_btn_clear_pick()
+            QMessageBox.information(
+                self,
+                "계층 그룹 안내",
+                f"선택한 객체는 이미 '{group_name}' 계층 그룹에 등록되어 있습니다."
+            )
+            return
+
         changed = False
         completely_moved_sources = []
         new_target_keys = []
 
-        for source_name, cell_indices in moves.items():
-            if not cell_indices:
+        for source_name in matched_sources:
+            source_mesh = self.part_meshes.get(source_name)
+            if source_mesh is None or source_mesh.n_cells == 0:
                 continue
 
-            source_mesh = self.part_meshes[source_name]
-            cell_indices = list(set(cell_indices))
+            current_group = source_name.split('/')[0] if '/' in source_name else None
+            if current_group == group_name:
+                continue
 
-            # 이동할 셀 추출 (타겟으로 추가)
-            extracted = source_mesh.extract_cells(cell_indices)
+            # [핵심] 선택한 객체의 모든 면(전체)을 이동 대상으로 복사 추출 (100% 모든 셀)
+            extracted = source_mesh.copy()
             if not isinstance(extracted, pv.PolyData):
                 extracted = extracted.extract_surface(algorithm='dataset_surface')
 
-            # 남길 셀 추출 (소스에서 제거)
-            all_cells = np.arange(source_mesh.n_cells)
-            keep_cells = np.setdiff1d(all_cells, cell_indices)
-
-            if len(keep_cells) > 0:
-                updated_source = source_mesh.extract_cells(keep_cells)
-                if not isinstance(updated_source, pv.PolyData):
-                    updated_source = updated_source.extract_surface(algorithm='dataset_surface')
-                if updated_source.n_cells > 0:
-                    try:
-                        updated_source = self.ensure_frontfaces_oriented(updated_source)
-                    except Exception:
-                        pass
-                self.part_meshes[source_name] = updated_source
-                self.viewport.update_mesh(source_name, updated_source, self.part_colors.get(source_name, [0.82, 0.82, 0.82]))
-            else:
-                completely_moved_sources.append(source_name)
+            # 소스 객체는 모든 면이 통째로 이동하므로 기존 그룹에서 완전 삭제 목록에 추가
+            completely_moved_sources.append(source_name)
 
             # 타겟 key 및 sub_name 결정
             sub_name = source_name.split('/')[-1] if '/' in source_name else source_name
             target_key = f"{group_name}/{sub_name}"
 
-            if target_key not in self.part_meshes:
-                self.part_meshes[target_key] = pv.PolyData()
+            # 동일 그룹 내 동일 sub_name 중복 시 고유 식별자 부여하여 독립 Component 보존
+            if target_key in self.part_meshes and target_key != source_name:
+                counter = 1
+                base_sub = sub_name
+                while target_key in self.part_meshes and target_key != source_name:
+                    sub_name = f"{base_sub}_{counter}"
+                    target_key = f"{group_name}/{sub_name}"
+                    counter += 1
 
-            cur_target_mesh = self.part_meshes[target_key]
-            pieces = [cur_target_mesh, extracted] if cur_target_mesh.n_cells > 0 else [extracted]
-            merged_piece = pieces[0].merge(pieces[1:]) if len(pieces) > 1 else pieces[0]
-            if not isinstance(merged_piece, pv.PolyData):
-                merged_piece = merged_piece.extract_surface(algorithm='dataset_surface')
-
-            if merged_piece.n_cells > 0:
+            if extracted.n_cells > 0:
                 try:
-                    merged_piece = self.ensure_frontfaces_oriented(merged_piece)
+                    extracted = self.ensure_frontfaces_oriented(extracted)
                 except Exception:
                     pass
 
-            self.part_meshes[target_key] = merged_piece
+            self.part_meshes[target_key] = extracted
 
             # 타겟 그룹 색상 적용
             target_color = self.part_colors.get(group_name, self.part_colors.get(source_name, [0.82, 0.82, 0.82]))
             self.part_colors[target_key] = target_color
-            self.viewport.update_mesh(target_key, merged_piece, target_color)
+
+            # 머티리얼 정보 인계
+            if hasattr(self, 'part_materials') and source_name in self.part_materials:
+                self.part_materials[target_key] = self.part_materials.pop(source_name)
+
+            # 앞면 노멀 고정 상태 인계
+            if hasattr(self, 'frontface_locked_parts') and source_name in self.frontface_locked_parts:
+                self.frontface_locked_parts.discard(source_name)
+                self.frontface_locked_parts.add(target_key)
+
+            # 뷰포트에 타겟 메쉬 갱신 등록
+            self.viewport.update_mesh(target_key, extracted, target_color)
             new_target_keys.append((target_key, sub_name))
             changed = True
 
@@ -2905,7 +3233,8 @@ class MainWindow(QMainWindow):
             for src_name in completely_moved_sources:
                 self.part_meshes.pop(src_name, None)
                 self.part_colors.pop(src_name, None)
-                self.part_materials.pop(src_name, None)
+                if hasattr(self, 'part_materials'):
+                    self.part_materials.pop(src_name, None)
                 if hasattr(self, 'frontface_locked_parts'):
                     self.frontface_locked_parts.discard(src_name)
 
@@ -2931,13 +3260,11 @@ class MainWindow(QMainWindow):
                                 if p_cnt > 0:
                                     parent_node.setText(0, f"{p_tag} ({p_cnt} Groups)")
                                 else:
-                                    idx = self.tree_widget.indexOfTopLevelItem(parent_node)
-                                    if idx != -1:
-                                        self.tree_widget.takeTopLevelItem(idx)
+                                    parent_node.setText(0, f"{p_tag} (0 Groups)")
                                 found_child = True
                                 break
                         if not found_child:
-                            if parent_node.data(0, Qt.UserRole) == src_name:
+                            if parent_node.data(0, Qt.UserRole) == src_name and parent_node.childCount() == 0:
                                 idx = self.tree_widget.indexOfTopLevelItem(parent_node)
                                 if idx != -1:
                                     self.tree_widget.takeTopLevelItem(idx)
@@ -2949,6 +3276,11 @@ class MainWindow(QMainWindow):
             pixmap.fill(QColor(*rgb_key))
             icon = QIcon(pixmap)
 
+            # [핵심 버그 수정] 대상 부모 그룹의 현재 체크(가시성) 상태 계승
+            # 대상 그룹이 체크 해제(Qt.Unchecked / Hide) 상태이면, 새로 이동된 객체도 정확히 체크 해제(Hide) 적용
+            p_check_state = parent_group_item.checkState(0)
+            target_child_state = Qt.Unchecked if p_check_state == Qt.Unchecked else Qt.Checked
+
             for t_key, sub_name in new_target_keys:
                 item_exists = False
                 for i in range(parent_group_item.childCount()):
@@ -2956,20 +3288,28 @@ class MainWindow(QMainWindow):
                     if child_node.data(0, Qt.UserRole) == t_key:
                         item_exists = True
                         child_node.setIcon(0, icon)
+                        child_node.setCheckState(0, target_child_state)
+                        child_node.setData(0, Qt.UserRole + 2, target_child_state)
                         break
 
                 if not item_exists:
                     new_item = QTreeWidgetItem(parent_group_item, [sub_name])
                     new_item.setFlags(new_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEditable)
-                    new_item.setCheckState(0, Qt.Checked)
+                    new_item.setCheckState(0, target_child_state)
                     new_item.setData(0, Qt.UserRole, t_key)
-                    new_item.setData(0, Qt.UserRole + 2, Qt.Checked)
+                    new_item.setData(0, Qt.UserRole + 2, target_child_state)
                     new_item.setIcon(0, icon)
 
-            # 3. 이동 대상 부모 그룹 카운트 텍스트 갱신
+            # 3. 이동 대상 부모 그룹 카운트 텍스트 갱신 및 3-state 체크 상태 동기화
             c_cnt = parent_group_item.childCount()
             if c_cnt > 0:
                 parent_group_item.setText(0, f"{group_name} ({c_cnt} Groups)")
+                tot = c_cnt
+                chk = sum(1 for i in range(tot) if parent_group_item.child(i).checkState(0) == Qt.Checked)
+                unchk = sum(1 for i in range(tot) if parent_group_item.child(i).checkState(0) == Qt.Unchecked)
+                new_p_state = Qt.Checked if chk == tot else (Qt.Unchecked if unchk == tot else Qt.PartiallyChecked)
+                parent_group_item.setCheckState(0, new_p_state)
+                parent_group_item.setData(0, Qt.UserRole + 2, new_p_state)
 
             parent_group_item.setExpanded(True)
 
@@ -2982,11 +3322,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "계층 그룹 이동 완료",
-                f"선택한 객체/면을 '{group_name}' 계층 그룹으로 성공적으로 이동 및 등록했습니다."
+                f"선택한 객체의 모든 면(전체)을 '{group_name}' 계층 그룹으로 성공적으로 이동 및 등록했습니다."
             )
         else:
             self.on_btn_clear_pick()
-            QMessageBox.information(self, "매칭 실패", "선택된 폴리곤과 원본 모델의 위치가 일치하지 않아 분할할 수 없습니다.")
+            QMessageBox.information(self, "계층 이동 확인", "선택된 객체가 이미 대상 계층 그룹에 속해 있거나 유효한 대상을 찾지 못했습니다.")
 
     def add_custom_node(self):
         """사용자가 수동으로 새로운 계층(부품 그룹)을 추가하여 향후 폴리(Poly) 분리 등 가공에 활용"""
@@ -4235,6 +4575,20 @@ class MainWindow(QMainWindow):
         if not file_path: return False
         import json, zipfile, tempfile, shutil, os
         import pyvista as pv
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import Qt
+
+        part_items = list(self.part_meshes.items()) if hasattr(self, 'part_meshes') and self.part_meshes else []
+        total_mesh_count = len(part_items)
+        max_progress_val = total_mesh_count + 10
+
+        progress = self._create_progress_dialog(
+            "💾 ANF 프로젝트 저장 중",
+            "프로젝트 패키징 준비 중...",
+            max_val=max_progress_val
+        )
+        progress.setValue(1)
+        QApplication.processEvents()
         
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -4303,6 +4657,10 @@ class MainWindow(QMainWindow):
                 }
 
                 # 1. 아웃라이너 부품 계층 및 가시성 수집 (재귀적 탐색)
+                progress.setLabelText("계층 구조 및 부품 정보 수집 중...")
+                progress.setValue(2)
+                QApplication.processEvents()
+
                 metadata["tree_hierarchy"] = {}
                 def collect_tree_items(parent_item, parent_tag=None):
                     for i in range(parent_item.childCount()):
@@ -4325,25 +4683,35 @@ class MainWindow(QMainWindow):
 
                 collect_tree_items(self.tree_widget.invisibleRootItem())
 
-                # 2. part_meshes에 등록된 모든 메시 100% 완전 저장
-                if hasattr(self, 'part_meshes') and self.part_meshes:
-                    for idx, (name, mesh) in enumerate(self.part_meshes.items()):
-                        if name not in metadata["parts"]:
-                            metadata["parts"].append(name)
-                            metadata["visibility"][name] = True
-                        if hasattr(self, 'part_colors') and name in self.part_colors:
-                            metadata["colors"][name] = self.part_colors[name]
-                        
-                        vtp_filename = f"part_{idx}.vtp"
-                        vtp_rel_path = f"meshes/{vtp_filename}"
-                        vtp_abs_path = os.path.join(meshes_dir, vtp_filename)
-                        try:
-                            mesh.save(vtp_abs_path)
-                            metadata["mesh_files"][name] = vtp_rel_path
-                        except Exception as e_vtp:
-                            print(f"메시 VTP 저장 실패 ({name}): {e_vtp}")
+                # 2. part_meshes에 등록된 모든 메시 100% 완전 저장 (실시간 Progress & processEvents)
+                step_val = 3
+                for idx, (name, mesh) in enumerate(part_items):
+                    disp_name = (name[:30] + '...') if len(name) > 30 else name
+                    progress.setLabelText(f"3D 메시 데이터 보존 중 ({idx+1}/{total_mesh_count}):\n{disp_name}")
+                    progress.setValue(min(step_val, total_mesh_count + 3))
+                    QApplication.processEvents()
+                    step_val += 1
+
+                    if name not in metadata["parts"]:
+                        metadata["parts"].append(name)
+                        metadata["visibility"][name] = True
+                    if hasattr(self, 'part_colors') and name in self.part_colors:
+                        metadata["colors"][name] = self.part_colors[name]
+                    
+                    vtp_filename = f"part_{idx}.vtp"
+                    vtp_rel_path = f"meshes/{vtp_filename}"
+                    vtp_abs_path = os.path.join(meshes_dir, vtp_filename)
+                    try:
+                        mesh.save(vtp_abs_path)
+                        metadata["mesh_files"][name] = vtp_rel_path
+                    except Exception as e_vtp:
+                        print(f"메시 VTP 저장 실패 ({name}): {e_vtp}")
 
                 # 3. 개별 부품별 PBR 재질 수치 및 HDRI / 텍스처 경로 저장
+                progress.setLabelText("PBR 재질 및 텍스처 맵 패키징 중...")
+                progress.setValue(total_mesh_count + 4)
+                QApplication.processEvents()
+
                 if hasattr(self, 'part_materials') and self.part_materials:
                     for p_name, m_info in self.part_materials.items():
                         metadata["part_materials"][p_name] = process_mat_dict(m_info)
@@ -4362,20 +4730,39 @@ class MainWindow(QMainWindow):
                     metadata["last_applied_material"] = process_mat_dict(self.last_applied_material)
 
                 # 메타데이터 JSON 파일 기록
+                progress.setLabelText("프로젝트 메타데이터 기록 중...")
+                progress.setValue(total_mesh_count + 6)
+                QApplication.processEvents()
+
                 with open(os.path.join(tmpdir, "metadata.json"), "w", encoding="utf-8") as f:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)
 
                 # 전체 tempdir 압축 (.anf)
-                with zipfile.ZipFile(file_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for root_dir, _, files in os.walk(tmpdir):
-                        for f in files:
-                            abs_path = os.path.join(root_dir, f)
-                            zf.write(abs_path, arcname=os.path.relpath(abs_path, tmpdir))
+                progress.setLabelText("ANF 아카이브 압축 파일 빌드 중...")
+                progress.setValue(total_mesh_count + 8)
+                QApplication.processEvents()
 
+                file_list = []
+                for root_dir, _, files in os.walk(tmpdir):
+                    for f in files:
+                        file_list.append(os.path.join(root_dir, f))
+
+                with zipfile.ZipFile(file_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for i, abs_path in enumerate(file_list):
+                        zf.write(abs_path, arcname=os.path.relpath(abs_path, tmpdir))
+                        if i % 10 == 0:
+                            QApplication.processEvents()
+
+                progress.setValue(max_progress_val)
+                progress.setLabelText("프로젝트 저장 완료!")
+                QApplication.processEvents()
+
+            progress.close()
             QMessageBox.information(self, "저장 완료", "모든 메시, 텍스처 파일, PBR 재질 수치 및 슬롯 정보가 성공적으로 저장되었습니다.")
             self.update_window_title(file_path)
             return True
         except Exception as e:
+            if 'progress' in locals(): progress.close()
             QMessageBox.critical(self, "저장 오류", f"프로젝트 저장 중 오류 발생:\n{e}")
             return False
 
@@ -5366,6 +5753,121 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    DARK_THEME_QSS = """
+    QMainWindow, QDialog, QWidget#central_widget {
+        background-color: #1e1e24;
+        color: #e2e8f0;
+        font-family: 'Segoe UI', 'Malgun Gothic', sans-serif;
+    }
+    QWidget {
+        color: #e2e8f0;
+    }
+    QMenuBar, QMenu {
+        background-color: #25252e;
+        color: #e2e8f0;
+    }
+    QMenu::item:selected {
+        background-color: #2563eb;
+        color: #ffffff;
+    }
+    QTabWidget::pane {
+        border: 1px solid #333842;
+        background-color: #23272e;
+    }
+    QTabBar::tab {
+        background-color: #1a1d24;
+        color: #94a3b8;
+        padding: 8px 16px;
+        border-top-left-radius: 4px;
+        border-top-right-radius: 4px;
+    }
+    QTabBar::tab:selected {
+        background-color: #23272e;
+        color: #38bdf8;
+        font-weight: bold;
+    }
+    QPushButton {
+        background-color: #2b303c;
+        color: #e2e8f0;
+        border: 1px solid #3e4451;
+        border-radius: 4px;
+        padding: 6px 12px;
+    }
+    QPushButton:hover {
+        background-color: #3b4252;
+        border-color: #60a5fa;
+    }
+    QPushButton:pressed {
+        background-color: #1e222a;
+    }
+    QTreeWidget {
+        background-color: #D3D3D3;
+        color: #111111;
+        border: 1px solid #B0B0B0;
+    }
+    QTreeWidget::item {
+        color: #111111;
+    }
+    QTreeWidget::item:selected {
+        background-color: #2563eb;
+        color: #ffffff;
+    }
+    QTreeWidget::item:hover {
+        background-color: #BEBEBE;
+        color: #000000;
+    }
+    QListWidget, QTableWidget {
+        background-color: #1b1d23;
+        color: #e2e8f0;
+        border: 1px solid #333842;
+        gridline-color: #2d313b;
+    }
+    QHeaderView::section {
+        background-color: #D3D3D3;
+        color: #111111;
+        font-weight: bold;
+        padding: 4px;
+        border: 1px solid #B0B0B0;
+    }
+    QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+        background-color: #16181d;
+        color: #f1f5f9;
+        border: 1px solid #333842;
+        border-radius: 4px;
+        padding: 4px;
+    }
+    QComboBox QAbstractItemView {
+        background-color: #1e222b;
+        color: #e2e8f0;
+        selection-background-color: #2563eb;
+    }
+    QGroupBox {
+        border: 1px solid #333842;
+        border-radius: 6px;
+        margin-top: 10px;
+        padding-top: 10px;
+        font-weight: bold;
+        color: #f1f5f9;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        subcontrol-position: top left;
+        padding: 0 6px;
+        color: #38bdf8;
+    }
+    QScrollBar:vertical {
+        background: #181a1f;
+        width: 10px;
+    }
+    QScrollBar::handle:vertical {
+        background: #3b4252;
+        border-radius: 4px;
+    }
+    QScrollBar::handle:vertical:hover {
+        background: #4c566a;
+    }
+    """
+    app.setStyleSheet(DARK_THEME_QSS)
     activity_logger = install_activity_logger(app)
     log_action("PROGRAM_START", "AI-NanoStudio 애플리케이션 시작")
     if os.path.exists(ICON_PATH):

@@ -27,6 +27,17 @@ class SmoothInteractionFilter(QObject):
         elif t == QEvent.MouseButtonRelease:
             self.is_dragging = False
         elif t == QEvent.MouseMove and self.is_dragging:
+            # 피킹 모드 중(피커 사용 중이거나 RubberBand 인터랙터 스타일)에는 이벤트 드랍 없이 100% 바이패스
+            try:
+                if hasattr(self.target, 'picking') and getattr(self.target.picking, '_picker_in_use', False):
+                    return super().eventFilter(obj, event)
+                iren = getattr(self.target, 'iren', None)
+                if iren and hasattr(iren, 'get_interactor_style'):
+                    st = iren.get_interactor_style()
+                    if st and 'RubberBand' in type(st).__name__:
+                        return super().eventFilter(obj, event)
+            except Exception:
+                pass
             now = time.perf_counter()
             if now - self.last_time < self.min_interval:
                 return True
@@ -343,21 +354,24 @@ class ViewportWidget(QWidget):
         for plotter in self.plotters:
             plotter.set_background(bg_color)
             
-        # 각 뷰포트 카메라 시선(방향)에 직교하는 2D 배경 그리드를 생성
-        # 평면도(Top) 및 시네마틱 뷰 - XY 평면 (Z축 방향에서 바라봄) (크기 320m x 320m, 해상도 320)
+        # 각 뷰포트 카메라 시선(방향)에 직교하는 2D 배경 그리드를 생성 (4개 직교 뷰 시선 100% 매칭)
+        # 평면도(Top View) - XY 평면 (+Z에서 -Z를 바라봄)
+        grid_xy_top = pv.Plane(center=(0,0,0), direction=(0,0,-1), i_size=320, j_size=320, i_resolution=320, j_resolution=320)
         grid_xy = pv.Plane(center=(0,0,0), direction=(0,0,1), i_size=320, j_size=320, i_resolution=320, j_resolution=320)
-        # 정면도(Front) - YZ 평면 (X축 방향에서 바라봄)
-        grid_yz = pv.Plane(center=(0,0,0), direction=(1,0,0), i_size=320, j_size=320, i_resolution=320, j_resolution=320)
-        # 측면도(Right/Left) - XZ 평면 (Y축 방향에서 바라봄)
-        grid_xz = pv.Plane(center=(0,0,0), direction=(0,1,0), i_size=320, j_size=320, i_resolution=320, j_resolution=320)
+        # 정면도(Front View) - YZ 평면 (-X에서 +X를 바라봄)
+        grid_yz_front = pv.Plane(center=(0,0,0), direction=(1,0,0), i_size=320, j_size=320, i_resolution=320, j_resolution=320)
+        # 우측면도(Right View) - XZ 평면 (+Y에서 -Y를 바라봄)
+        grid_xz_right = pv.Plane(center=(0,0,0), direction=(0,-1,0), i_size=320, j_size=320, i_resolution=320, j_resolution=320)
+        # 좌측면도(Left View) - XZ 평면 (-Y에서 +Y를 바라봄)
+        grid_xz_left = pv.Plane(center=(0,0,0), direction=(0,1,0), i_size=320, j_size=320, i_resolution=320, j_resolution=320)
         
-        # 각 뷰포트에 백그라운드용 그리드를 투명한 와이어프레임으로 추가
+        # 각 뷰포트에 백그라운드용 그리드를 투명한 와이어프레임으로 추가 (culling=False로 컬링 방지 및 양면 렌더링 보장)
         actors = []
-        actors.append(self.plotter_single.add_mesh(grid_xy, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False))
-        actors.append(self.plotter_tl.add_mesh(grid_xy, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False)) # Top
-        actors.append(self.plotter_bl.add_mesh(grid_yz, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False)) # Front
-        actors.append(self.plotter_tr.add_mesh(grid_xz, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False)) # Right
-        actors.append(self.plotter_br.add_mesh(grid_xz, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False)) # Left
+        actors.append(self.plotter_single.add_mesh(grid_xy, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False, culling=False))
+        actors.append(self.plotter_tl.add_mesh(grid_xy_top, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False, culling=False)) # Top
+        actors.append(self.plotter_bl.add_mesh(grid_yz_front, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False, culling=False)) # Front
+        actors.append(self.plotter_tr.add_mesh(grid_xz_right, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False, culling=False)) # Right
+        actors.append(self.plotter_br.add_mesh(grid_xz_left, style='wireframe', color=grid_color, line_width=1, opacity=0.4, name='bg_grid', reset_camera=False, pickable=False, culling=False)) # Left
 
         # 십자 축(Axis) 라인 시각화 (선 두께를 굵게 하여 중심 축 강조)
         axis_length = 160 # 그리드 반경에 맞춰 연장
